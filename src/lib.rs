@@ -1,12 +1,16 @@
 use std::{
     cell::UnsafeCell,
-    hint,
     mem::MaybeUninit,
     ptr::{self, NonNull},
     sync::atomic::{AtomicUsize, Ordering},
     thread,
 };
 
+/// The inner queue used by `Sender` and `Receiver`.
+///
+/// # Invariants
+/// - head is valid value, unlesss head == tail,
+/// - tail is invalid, where we add next value
 pub struct Queue<T> {
     buffer: Box<[UnsafeCell<MaybeUninit<T>>]>,
     head: AtomicUsize,
@@ -31,6 +35,7 @@ impl<T> Queue<T> {
         let buffer = (0..capacity)
             .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
             .collect();
+
         Self {
             buffer,
             head: AtomicUsize::new(0),
@@ -47,6 +52,7 @@ impl<T> Drop for Queue<T> {
         let tail = self.tail.load(Ordering::SeqCst);
 
         while head != tail {
+            // SAFETY: we own all the existing values in the queue.
             unsafe {
                 ptr::drop_in_place((&mut *self.buffer[head].get()).as_mut_ptr());
             }
@@ -59,31 +65,19 @@ impl<T> Sender<T> {
     pub fn send(&mut self, val: T) {
         let buffer = unsafe { self.buffer.as_mut() };
 
-        let mut cur_tail = buffer.tail.load(Ordering::Relaxed);
-        let mut new_tail = (cur_tail + 1) % buffer.capacity;
+        let cur_tail = buffer.tail.load(Ordering::Relaxed);
+        let new_tail = (cur_tail + 1) % buffer.capacity;
 
         while self.local_head == new_tail {
+            // relaxed ordering is fine because head will never go backwards
             self.local_head = buffer.head.load(Ordering::Relaxed);
             thread::yield_now();
         }
 
         buffer.buffer[cur_tail].get_mut().write(val);
 
-        loop {
-            match buffer.tail.compare_exchange_weak(
-                cur_tail,
-                new_tail,
-                Ordering::SeqCst,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual_cur_tail) => cur_tail = actual_cur_tail,
-            };
-
-            new_tail = (cur_tail + 1) % buffer.capacity;
-
-            hint::spin_loop();
-        }
+        // this is fine as we are the only ones writing to tail
+        buffer.tail.store(new_tail, Ordering::Release);
     }
 }
 
@@ -104,29 +98,19 @@ impl<T> Receiver<T> {
     pub fn recv(&mut self) -> T {
         let buffer = unsafe { self.buffer.as_mut() };
 
-        let mut cur_head = buffer.head.load(Ordering::Relaxed);
+        let cur_head = buffer.head.load(Ordering::Relaxed);
 
         while cur_head == self.local_tail {
+            // relaxed ordering is fine because tail will never go backwards
             self.local_tail = buffer.tail.load(Ordering::Relaxed);
             thread::yield_now();
         }
 
-        let head = loop {
-            let new_head = (cur_head + 1) % buffer.capacity;
-            match buffer.head.compare_exchange_weak(
-                cur_head,
-                new_head,
-                Ordering::SeqCst,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break cur_head,
-                Err(actual_cur_head) => cur_head = actual_cur_head,
-            };
+        let new_head = (cur_head + 1) % buffer.capacity;
+        // this is fine as we are the only ones writing to head
+        buffer.head.store(new_head, Ordering::Release);
 
-            std::hint::spin_loop();
-        };
-
-        unsafe { ptr::read(buffer.buffer[head].get() as *const _) }
+        unsafe { ptr::read(buffer.buffer[cur_head].get() as *const _) }
     }
 }
 
