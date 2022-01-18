@@ -43,6 +43,7 @@ pub struct Receiver<T> {
     local_tail: usize,
 }
 
+#[inline]
 pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     let queue = Queue::with_capacity(capacity);
     queue.rc.store(2, Ordering::SeqCst);
@@ -62,6 +63,7 @@ pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 }
 
 impl<T> Queue<T> {
+    #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
         let capacity = capacity + 1;
         let buffer = (0..capacity)
@@ -88,19 +90,26 @@ impl<T> Drop for Queue<T> {
             unsafe {
                 ptr::drop_in_place((&mut *self.buffer[head].get()).as_mut_ptr());
             }
-            head = (head + 1) % self.capacity;
+            head = head + 1;
+            if head == self.capacity {
+                head = 0;
+            }
         }
     }
 }
 
 impl<T> Sender<T> {
+    #[inline]
     pub fn try_send(&mut self, val: T) -> Result<(), T> {
         // SAFETY: we are the only ones accessing it apart from other end which will not remove the
         // buffer, so its safe to derefernce.
         let buffer = unsafe { self.buffer.as_mut() };
 
         let cur_tail = buffer.tail.load(Ordering::Acquire);
-        let new_tail = (cur_tail + 1) % buffer.capacity;
+        let mut new_tail = cur_tail + 1;
+        if new_tail == buffer.capacity {
+            new_tail = 0;
+        }
 
         if self.local_head == new_tail {
             // relaxed ordering is fine because head will never go backwards
@@ -121,13 +130,17 @@ impl<T> Sender<T> {
         Ok(())
     }
 
+    #[inline]
     pub fn send(&mut self, val: T) {
         // SAFETY: we are the only ones accessing it apart from other end which will not remove the
         // buffer, so its safe to derefernce.
         let buffer = unsafe { self.buffer.as_mut() };
 
         let cur_tail = buffer.tail.load(Ordering::Acquire);
-        let new_tail = (cur_tail + 1) % buffer.capacity;
+        let mut new_tail = cur_tail + 1;
+        if new_tail == buffer.capacity {
+            new_tail = 0;
+        }
 
         while self.local_head == new_tail {
             // relaxed ordering is fine because head will never go backwards
@@ -173,7 +186,7 @@ impl<T> Receiver<T> {
         // buffer, so its safe to derefernce.
         let buffer = unsafe { self.buffer.as_mut() };
 
-        let cur_head = buffer.head.load(Ordering::Acquire);
+        let cur_head = buffer.head.load(Ordering::Relaxed);
 
         if cur_head == self.local_tail {
             // relaxed ordering is fine because tail will never go backwards
@@ -188,8 +201,12 @@ impl<T> Receiver<T> {
 
         let val = unsafe { ptr::read(buffer.buffer[cur_head].get() as *const _) };
 
+        let mut new_head = cur_head + 1;
+        if new_head == buffer.capacity {
+            new_head = 0;
+        }
+
         // this is fine as we are the only ones writing to head
-        let new_head = (cur_head + 1) % buffer.capacity;
         buffer.head.store(new_head, Ordering::Release);
 
         Some(val)
@@ -200,7 +217,7 @@ impl<T> Receiver<T> {
         // buffer, so its safe to derefernce.
         let buffer = unsafe { self.buffer.as_mut() };
 
-        let cur_head = buffer.head.load(Ordering::Acquire);
+        let cur_head = buffer.head.load(Ordering::Relaxed);
 
         while cur_head == self.local_tail {
             // relaxed ordering is fine because tail will never go backwards
@@ -208,7 +225,11 @@ impl<T> Receiver<T> {
             hint::spin_loop();
         }
 
-        let new_head = (cur_head + 1) % buffer.capacity;
+        let mut new_head = cur_head + 1;
+        if new_head == buffer.capacity {
+            new_head = 0;
+        }
+
         // this is fine as we are the only ones writing to head
         buffer.head.store(new_head, Ordering::Release);
 
@@ -381,16 +402,16 @@ mod test {
     #[test]
     fn loom_tester() {
         loom::model(|| {
-            const COUNTS: usize = 4;
+            const COUNTS: usize = 3;
             let (mut tx, mut rx) = channel(COUNTS);
 
             thread::spawn(move || {
-                for i in 0..COUNTS + 5 {
+                for i in 0..COUNTS + 4 {
                     tx.send(i);
                 }
             });
 
-            for i in 0..COUNTS + 5 {
+            for i in 0..COUNTS + 4 {
                 let r = rx.recv();
                 assert_eq!(r, i);
             }

@@ -9,14 +9,18 @@ fn main() {
 
     let handle = thread::spawn(move || {
         for i in 0..COUNT {
-            tx.send(i);
+            let _ = tx.try_send(i);
         }
     });
 
     let _ = handle.join();
 
+    let mut sum = 0;
     for i in 0..COUNT {
-        let r = rx.recv();
+        let r = unsafe { rx.try_recv().unwrap_unchecked() };
+        sum += r & 1000007;
         assert_eq!(r, i);
     }
+
+    println!("{}", sum);
 }
