@@ -105,7 +105,7 @@ impl<T> Sender<T> {
         // buffer, so its safe to derefernce.
         let buffer = unsafe { self.buffer.as_mut() };
 
-        let cur_tail = buffer.tail.load(Ordering::Acquire);
+        let cur_tail = buffer.tail.load(Ordering::Relaxed);
         let mut new_tail = cur_tail + 1;
         if new_tail == buffer.capacity {
             new_tail = 0;
@@ -124,8 +124,8 @@ impl<T> Sender<T> {
 
         buffer.buffer[cur_tail].get_mut().write(val);
 
-        // this is fine as we are the only ones writing to tail
-        buffer.tail.store(new_tail, Ordering::Release);
+        // store is fine as we are the only ones writing to tail
+        buffer.tail.store(new_tail, Ordering::Relaxed);
 
         Ok(())
     }
@@ -136,22 +136,20 @@ impl<T> Sender<T> {
         // buffer, so its safe to derefernce.
         let buffer = unsafe { self.buffer.as_mut() };
 
-        let cur_tail = buffer.tail.load(Ordering::Acquire);
+        let cur_tail = buffer.tail.load(Ordering::Relaxed);
         let mut new_tail = cur_tail + 1;
         if new_tail == buffer.capacity {
             new_tail = 0;
         }
 
         while self.local_head == new_tail {
-            // relaxed ordering is fine because head will never go backwards
-            self.local_head = buffer.head.load(Ordering::Relaxed);
-
+            self.local_head = buffer.head.load(Ordering::Acquire);
             hint::spin_loop();
         }
 
         buffer.buffer[cur_tail].get_mut().write(val);
 
-        // this is fine as we are the only ones writing to tail
+        // store is fine as we are the only ones writing to tail
         buffer.tail.store(new_tail, Ordering::Release);
     }
 
@@ -207,7 +205,7 @@ impl<T> Receiver<T> {
         }
 
         // this is fine as we are the only ones writing to head
-        buffer.head.store(new_head, Ordering::Release);
+        buffer.head.store(new_head, Ordering::Relaxed);
 
         Some(val)
     }
@@ -221,7 +219,7 @@ impl<T> Receiver<T> {
 
         while cur_head == self.local_tail {
             // relaxed ordering is fine because tail will never go backwards
-            self.local_tail = buffer.tail.load(Ordering::Relaxed);
+            self.local_tail = buffer.tail.load(Ordering::Acquire);
             hint::spin_loop();
         }
 
