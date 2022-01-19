@@ -1,6 +1,6 @@
 # spsc
 
-An single-producer-single-consumer queue, inspired from [Facebook's folly's implementation](https://github.com/facebook/folly/blob/main/folly/ProducerConsumerQueue.h)
+A single-producer-single-consumer queue, inspired from [Facebook's folly's implementation](https://github.com/facebook/folly/blob/main/folly/ProducerConsumerQueue.h).
 
 The producer and consumer can run on different threads, but there can only be one producer and only one consumer. The producer (or consumer) can be moved between threads, but can not be shared between threads. The queue doesn't grow as needed, the capacity needs to be passed when creating the queue.
 
@@ -34,3 +34,8 @@ fn main() {
     }
 }
 ```
+
+### TODO
+
+- [ ] make a unbounded version which grows capacity as needed
+- [ ] add batch send/recv functions
