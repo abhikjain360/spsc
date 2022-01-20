@@ -10,6 +10,8 @@ Some primitive benchmarks show that it's performance in sync version is compared
 
 ### Example
 
+sync version
+
 ```rust
 use std::thread;
 
@@ -22,14 +24,46 @@ fn main() {
 
     let handle = thread::spawn(move || {
         for i in 0..COUNT {
-            let _ = tx.try_send(i);
+			// block until send completes
+            let _ = tx.send(i);
         }
     });
 
     let _ = handle.join();
 
     for i in 0..COUNT {
-        let r = unsafe { rx.try_recv().unwrap_unchecked() };
+		// block until recv completes
+        let r = rx.recv();
+        assert_eq!(r, i);
+    }
+}
+```
+
+async version
+
+```rust
+use std::thread;
+
+use spsc::channel;
+
+#[tokio::main]
+fn main() {
+    const COUNT: u32 = 100_000_000;
+
+    let (mut tx, mut rx) = channel::<u32>(COUNT as usize);
+
+    let handle = tokio::spawn(move || {
+        for i in 0..COUNT {
+			// block until send completes
+            let _ = tx.send_async(i);
+        }
+    });
+
+    let _ = handle.await();
+
+    for i in 0..COUNT {
+		// block until recv completes
+        let r = rx.recv_async();
         assert_eq!(r, i);
     }
 }
@@ -37,5 +71,5 @@ fn main() {
 
 ### TODO
 
-- [ ] make a unbounded version which grows capacity as needed
+- [X] make a unbounded version which grows capacity as needed
 - [ ] add batch send/recv functions
