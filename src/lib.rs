@@ -1,5 +1,6 @@
 use std::{
     cell::UnsafeCell,
+    iter,
     mem::MaybeUninit,
     pin::Pin,
     ptr::{self, NonNull},
@@ -99,7 +100,6 @@ impl<T> Drop for Queue<T> {
 }
 
 impl<T> Sender<T> {
-    #[inline]
     pub fn try_send(&mut self, val: T) -> Result<(), T> {
         // SAFETY: we are the only ones accessing it apart from other end which will not remove the
         // buffer, so its safe to derefernce.
@@ -112,11 +112,8 @@ impl<T> Sender<T> {
         }
 
         if self.local_head == new_tail {
-            // relaxed ordering is fine because head will never go backwards
             self.local_head = buffer.head.load(Ordering::Relaxed);
 
-            // retry with updated head value
-            // checking twice is still cheaper than reading atomically twice
             if self.local_head == new_tail {
                 return Err(val);
             }
@@ -130,7 +127,6 @@ impl<T> Sender<T> {
         Ok(())
     }
 
-    #[inline]
     pub fn send(&mut self, val: T) {
         // SAFETY: we are the only ones accessing it apart from other end which will not remove the
         // buffer, so its safe to derefernce.
@@ -142,21 +138,112 @@ impl<T> Sender<T> {
             new_tail = 0;
         }
 
-        while self.local_head == new_tail {
+        if self.local_head == new_tail {
             self.local_head = buffer.head.load(Ordering::Acquire);
-            hint::spin_loop();
+
+            while self.local_head == new_tail {
+                hint::spin_loop();
+                self.local_head = buffer.head.load(Ordering::Acquire);
+            }
         }
 
         buffer.buffer[cur_tail].get_mut().write(val);
 
-        // store is fine as we are the only ones writing to tail
         buffer.tail.store(new_tail, Ordering::Release);
     }
 
+    #[inline]
     pub fn send_async(&mut self, val: T) -> SendFut<'_, T> {
         SendFut {
             sender: self,
             to_send: Some(val),
+        }
+    }
+
+    pub fn batch_send(&mut self, vals: &mut impl Iterator<Item = T>) -> usize {
+        // SAFETY: we are the only ones accessing it apart from other end which will not remove the
+        // buffer, so its safe to derefernce.
+        let buffer = unsafe { self.buffer.as_mut() };
+        let mut count = 0;
+
+        let mut cur_tail = buffer.tail.load(Ordering::Relaxed);
+        let mut new_tail = cur_tail + 1;
+        if new_tail == buffer.capacity {
+            new_tail = 0;
+        }
+
+        loop {
+            if self.local_head == new_tail {
+                buffer.tail.store(cur_tail, Ordering::Release);
+
+                self.local_head = buffer.head.load(Ordering::Acquire);
+                if self.local_head == new_tail {
+                    return count;
+                }
+            }
+
+            let val = match vals.next() {
+                Some(v) => v,
+                None => break,
+            };
+
+            buffer.buffer[cur_tail].get_mut().write(val);
+            count += 1;
+
+            cur_tail = new_tail;
+            new_tail += 1;
+            if new_tail == buffer.capacity {
+                new_tail = 0;
+            }
+        }
+
+        buffer.tail.store(cur_tail, Ordering::Release);
+        count
+    }
+
+    pub fn batch_send_all(&mut self, vals: impl Iterator<Item = T>) {
+        // SAFETY: we are the only ones accessing it apart from other end which will not remove the
+        // buffer, so its safe to derefernce.
+        let buffer = unsafe { self.buffer.as_mut() };
+
+        let mut cur_tail = buffer.tail.load(Ordering::Relaxed);
+        let mut new_tail = cur_tail + 1;
+        if new_tail == buffer.capacity {
+            new_tail = 0;
+        }
+
+        for val in vals {
+            if self.local_head == new_tail {
+                buffer.tail.store(cur_tail, Ordering::Release);
+
+                self.local_head = buffer.head.load(Ordering::Acquire);
+                while self.local_head == new_tail {
+                    hint::spin_loop();
+                    self.local_head = buffer.head.load(Ordering::Acquire);
+                }
+            }
+
+            buffer.buffer[cur_tail].get_mut().write(val);
+
+            cur_tail = new_tail;
+            new_tail += 1;
+            if new_tail == buffer.capacity {
+                new_tail = 0;
+            }
+        }
+
+        buffer.tail.store(cur_tail, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn batch_send_all_async<I: Iterator<Item = T>>(
+        &mut self,
+        vals: I,
+    ) -> BatchSendAllFut<'_, T, I> {
+        BatchSendAllFut {
+            sender: self,
+            iter: vals.peekable(),
+            total_count: 0,
         }
     }
 }
@@ -187,7 +274,6 @@ impl<T> Receiver<T> {
         let cur_head = buffer.head.load(Ordering::Relaxed);
 
         if cur_head == self.local_tail {
-            // relaxed ordering is fine because tail will never go backwards
             self.local_tail = buffer.tail.load(Ordering::Relaxed);
 
             // cretry with updated head value
@@ -217,11 +303,16 @@ impl<T> Receiver<T> {
 
         let cur_head = buffer.head.load(Ordering::Relaxed);
 
-        while cur_head == self.local_tail {
-            // relaxed ordering is fine because tail will never go backwards
+        if cur_head == self.local_tail {
             self.local_tail = buffer.tail.load(Ordering::Acquire);
-            hint::spin_loop();
+
+            while cur_head == self.local_tail {
+                hint::spin_loop();
+                self.local_tail = buffer.tail.load(Ordering::Acquire);
+            }
         }
+
+        let val = unsafe { ptr::read(buffer.buffer[cur_head].get() as *const _) };
 
         let mut new_head = cur_head + 1;
         if new_head == buffer.capacity {
@@ -231,11 +322,47 @@ impl<T> Receiver<T> {
         // this is fine as we are the only ones writing to head
         buffer.head.store(new_head, Ordering::Release);
 
-        unsafe { ptr::read(buffer.buffer[cur_head].get() as *const _) }
+        val
     }
 
+    #[inline]
     pub fn recv_async(&mut self) -> RecvFut<'_, T> {
         RecvFut { receiver: self }
+    }
+
+    pub fn batch_recv(&mut self, buf: &mut impl iter::Extend<T>, limit: usize) -> usize {
+        // SAFETY: we are the only ones accessing it apart from other end which will not remove the
+        // buffer, so its safe to derefernce.
+        let buffer = unsafe { self.buffer.as_mut() };
+        let mut count = 0;
+
+        let mut cur_head = buffer.head.load(Ordering::Relaxed);
+
+        while count < limit {
+            if cur_head == self.local_tail {
+                self.local_tail = buffer.tail.load(Ordering::Relaxed);
+
+                // cretry with updated head value
+                // hecking twice is still cheaper than reading atomically twice
+                if cur_head == self.local_tail {
+                    break;
+                }
+            }
+
+            // TODO: change this to extend_one when it stabilizes
+            buf.extend(iter::once(unsafe {
+                ptr::read(buffer.buffer[cur_head].get() as *const _)
+            }));
+            count += 1;
+
+            cur_head += 1;
+            if cur_head == buffer.capacity {
+                cur_head = 0;
+            }
+        }
+
+        buffer.head.store(cur_head, Ordering::Release);
+        count
     }
 }
 
@@ -261,11 +388,11 @@ pub struct SendFut<'sender, T> {
     to_send: Option<T>,
 }
 
-impl<'sender, T> Unpin for SendFut<'sender, T> {}
-
 impl<'sender, T> SendFut<'sender, T> {
+    #[inline]
     fn project(self: Pin<&mut Self>) -> (&mut Sender<T>, &mut Option<T>) {
-        let me = self.get_mut();
+        // SAFETY: we should NEVER move out any values
+        let me = unsafe { self.get_unchecked_mut() };
         (&mut me.sender, &mut me.to_send)
     }
 }
@@ -278,8 +405,8 @@ impl<'sender, T> Future for SendFut<'sender, T> {
         match sender.try_send(to_send.take().unwrap()) {
             Ok(_) => Poll::Ready(()),
             Err(val) => {
-                cx.waker().wake_by_ref();
                 *to_send = Some(val);
+                cx.waker().wake_by_ref();
                 Poll::Pending
             }
         }
@@ -290,11 +417,11 @@ pub struct RecvFut<'receiver, T> {
     receiver: &'receiver mut Receiver<T>,
 }
 
-impl<'receiver, T> Unpin for RecvFut<'receiver, T> {}
-
 impl<'receiver, T> RecvFut<'receiver, T> {
+    #[inline]
     fn project(self: Pin<&mut Self>) -> &mut Receiver<T> {
-        let me = self.get_mut();
+        // SAFETY: we should NEVER move out any values
+        let me = unsafe { self.get_unchecked_mut() };
         me.receiver
     }
 }
@@ -314,6 +441,36 @@ impl<'receiver, T> Future for RecvFut<'receiver, T> {
     }
 }
 
+pub struct BatchSendAllFut<'sender, T, I: Iterator<Item = T>> {
+    sender: &'sender mut Sender<T>,
+    iter: iter::Peekable<I>,
+    total_count: usize,
+}
+
+impl<'sender, T, I: Iterator<Item = T>> BatchSendAllFut<'sender, T, I> {
+    fn project(self: Pin<&mut Self>) -> (&mut Sender<T>, &mut iter::Peekable<I>, &mut usize) {
+        // SAFETY: we should NEVER move out any values
+        let me = unsafe { self.get_unchecked_mut() };
+        (me.sender, &mut me.iter, &mut me.total_count)
+    }
+}
+
+impl<'sender, T, I: Iterator<Item = T>> Future for BatchSendAllFut<'sender, T, I> {
+    type Output = usize;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let (sender, vals, total_count) = self.project();
+        *total_count += sender.batch_send(vals);
+        match vals.peek() {
+            Some(_) => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            None => Poll::Ready(*total_count),
+        }
+    }
+}
+
 // SAFETY: internal queue has atomic pointers to head and tails, and thus is safe to send
 unsafe impl<T: Send> Send for Sender<T> {}
 
@@ -329,9 +486,10 @@ unsafe impl<T: Send> Send for Receiver<T> {}
 
 #[cfg(test)]
 mod test {
+    use std::collections::VecDeque;
+
     #[cfg(not(loomer))]
     use std::{sync::Arc, thread};
-
     #[cfg(loomer)]
     use loom::{sync::Arc, thread};
 
@@ -343,12 +501,12 @@ mod test {
         let (mut tx, mut rx) = channel(COUNTS);
 
         thread::spawn(move || {
-            for i in 0..COUNTS << 8 {
+            for i in 0..COUNTS << 12 {
                 tx.send(i);
             }
         });
 
-        for i in 0..COUNTS << 8 {
+        for i in 0..COUNTS << 12 {
             let r = rx.recv();
             assert_eq!(r, i);
         }
@@ -416,21 +574,82 @@ mod test {
         });
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_async_send() {
         const COUNTS: usize = 4096;
         let (mut tx, mut rx) = channel(COUNTS);
 
-        let handle = tokio::spawn(async move {
-            for i in 0..COUNTS << 3 + 1 {
+        tokio::spawn(async move {
+            for i in 0..COUNTS << 8 + 1 {
                 tx.send_async(i).await;
             }
             drop(tx);
         });
-        for i in 0..COUNTS << 3 + 1 {
+        for i in 0..COUNTS << 8 + 1 {
             assert_eq!(rx.recv_async().await, i);
         }
-        handle.await.unwrap();
-        println!("done");
+    }
+
+    #[test]
+    fn test_batch_send() {
+        const COUNTS: usize = 256;
+        let (mut tx, mut rx) = channel(COUNTS);
+
+        thread::spawn(move || {
+            let v: Vec<u32> = (0..200).collect();
+            for _ in 0..COUNTS << 1 {
+                tx.batch_send_all(v.iter().map(|x| *x));
+            }
+        });
+
+        for _ in 0..COUNTS << 1 {
+            for i in 0..200 {
+                assert_eq!(rx.recv(), i);
+            }
+        }
+    }
+
+    #[test]
+    fn test_batch_recv() {
+        const COUNTS: usize = 256;
+
+        let (mut tx, mut rx) = channel(COUNTS);
+
+        thread::spawn(move || {
+            for i in 0..(COUNTS << 8) + (COUNTS >> 1) + 1 {
+                tx.send(i);
+            }
+        });
+
+
+        let mut buf = VecDeque::with_capacity(128);
+        let mut i = 0;
+        while i < (COUNTS << 8) + (COUNTS >> 1) + 1 {
+            rx.batch_recv(&mut buf, 128);
+            for val in buf.drain(..) {
+                assert_eq!(i, val);
+                i += 1;
+            }
+
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_async_batch_send() {
+        const COUNTS: usize = 256;
+        let (mut tx, mut rx) = channel(COUNTS);
+
+        tokio::spawn(async move {
+            let v: Vec<u32> = (0..200).collect();
+            for _ in 0..COUNTS << 1 {
+                tx.batch_send_all_async(v.clone().into_iter()).await;
+            }
+        });
+
+        for _ in 0..COUNTS << 1 {
+            for i in 0..200 {
+                assert_eq!(rx.recv(), i);
+            }
+        }
     }
 }
