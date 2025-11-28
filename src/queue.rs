@@ -17,20 +17,26 @@ pub(crate) type BufferCell<T> = UnsafeCell<MaybeUninit<T>>;
 #[cfg(loomer)]
 pub(crate) type BufferCell<T> = loom::cell::UnsafeCell<MaybeUninit<T>>;
 
+#[cfg(target_arch = "x86_64")]
+const CACHE_LINE_SIZE: usize = 64;
+#[cfg(target_arch = "aarch64")]
+const CACHE_LINE_SIZE: usize = 128;
+
 /// The inner queue used by `Sender` and `Receiver`.
 ///
 /// # Invariants
 /// - head is valid value, unlesss head == tail,
 /// - tail is invalid, where we add next value
-#[repr(C, align(64))]
+#[cfg_attr(target_arch = "aarch64", repr(C, align(128)))]
+#[cfg_attr(target_arch = "x86_64", repr(C, align(64)))]
 pub(crate) struct Queue<T> {
     pub(crate) head: AtomicUsize,
-    _pad1: [u8; 56],
+    _pad1: [u8; CACHE_LINE_SIZE - size_of::<AtomicUsize>()],
     pub(crate) tail: AtomicUsize,
-    _pad2: [u8; 56],
+    _pad2: [u8; CACHE_LINE_SIZE - size_of::<AtomicUsize>()],
     pub(crate) rc: AtomicUsize,
     pub(crate) capacity: usize,
-    _pad3: [u8; 48],
+    _pad3: [u8; CACHE_LINE_SIZE - size_of::<AtomicUsize>() - size_of::<usize>()],
     pub(crate) buffer: [BufferCell<T>; 0],
 }
 
