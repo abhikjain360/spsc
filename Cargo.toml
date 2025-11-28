@@ -1,0 +1,61 @@
+[package]
+name = "gil"
+version = "0.1.0"
+edition = "2024"
+authors = ["Abhik Jain <abhik@abhikjain.xyz>"]
+description = "A fast single-producer single-consumer queue with sync and async support"
+license = "MIT"
+repository = "https://github.com/abhikjain360/gil"
+documentation = "https://docs.rs/gil"
+homepage = "https://github.com/abhikjain360/gil"
+keywords = ["queue", "spsc", "channel", "async", "lock-free"]
+categories = ["concurrency", "data-structures", "asynchronous"]
+readme = "README.md"
+exclude = [".lazy.lua"]
+
+[dependencies]
+futures = "0.3.31"
+
+[dev-dependencies]
+criterion = { version = "0.7.0", features = ["async_tokio", "html_reports"] }
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
+
+# using 'loomer' in cfg because otherwise conflicts with tokio's internal use of 'loom' and fails
+# to compile
+[target.'cfg(loomer)'.dependencies]
+loom = { version = "0.7.2", features = ["futures"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loomer)'] }
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[[bench]]
+name = "throughput_async"
+harness = false
+
+[[bench]]
+name = "latency"
+harness = false
+
+[profile.release]
+opt-level = 3
+debug = true
+debug-assertions = false
+overflow-checks = false
+lto = 'fat'
+panic = 'abort'
+incremental = false
+codegen-units = 16
+rpath = false
+
+[profile.bench]
+# Enable debug symbols for benchmarks, but keep optimizations
+debug = true
+opt-level = 3
+lto = 'fat'
+incremental = false
+codegen-units = 16
+rpath = false
