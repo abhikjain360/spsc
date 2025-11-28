@@ -19,7 +19,7 @@
 //! use std::thread;
 //! use gil::channel;
 //!
-//! let (mut tx, mut rx) = channel::<u32>(100);
+//! let (mut tx, mut rx) = channel(100);
 //!
 //! thread::spawn(move || {
 //!     for i in 0..100 {
@@ -39,7 +39,7 @@
 //! use gil::channel;
 //!
 //! # async fn example() {
-//! let (mut tx, mut rx) = channel::<u32>(100);
+//! let (mut tx, mut rx) = channel(100);
 //!
 //! tokio::spawn(async move {
 //!     for i in 0..100 {
@@ -64,10 +64,18 @@ pub use receiver::Receiver;
 pub use sender::Sender;
 use sync::*;
 
+#[cfg(target_arch = "x86_64")]
+pub type QueueValue = u64;
+
+#[cfg(target_arch = "aarch64")]
+pub type QueueValue = u128;
+
 /// Creates a bounded single-producer single-consumer channel with the specified capacity.
 ///
-/// Returns a tuple of `(Sender<T>, Receiver<T>)`. The sender can be used to push values
+/// Returns a tuple of `(Sender, Receiver)`. The sender can be used to push values
 /// into the queue, and the receiver can be used to pull values from the queue.
+///
+/// The queue works with `u128` on aarch64 and `u64` on x86_64.
 ///
 /// # Arguments
 ///
@@ -79,12 +87,12 @@ use sync::*;
 /// ```
 /// use gil::channel;
 ///
-/// let (mut tx, mut rx) = channel::<i32>(10);
+/// let (mut tx, mut rx) = channel(10);
 /// tx.send(42);
 /// assert_eq!(rx.recv(), 42);
 /// ```
 #[inline]
-pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
+pub fn channel(capacity: usize) -> (Sender, Receiver) {
     let queue_ptr = Queue::with_capacity(capacity);
     unsafe {
         queue_ptr.as_ref().rc.store(2, Ordering::SeqCst);
@@ -107,13 +115,13 @@ mod test {
 
             thread::spawn(move || {
                 for i in 0..4 {
-                    tx.send(i);
+                    tx.send(i as QueueValue);
                 }
             });
 
             for i in 0..4 {
                 let r = rx.recv();
-                assert_eq!(r, i);
+                assert_eq!(r, i as QueueValue);
             }
         })
     }
@@ -125,57 +133,14 @@ mod test {
 
         thread::spawn(move || {
             for i in 0..COUNTS << 3 {
-                tx.send(i);
+                tx.send(i as QueueValue);
             }
         });
 
         for i in 0..COUNTS << 3 {
             let r = rx.recv();
-            assert_eq!(r, i);
+            assert_eq!(r, i as QueueValue);
         }
-    }
-
-    struct TestSruct(Arc<AtomicUsize>);
-    impl TestSruct {
-        fn new(counter: Arc<AtomicUsize>) -> Self {
-            counter.fetch_add(1, Ordering::SeqCst);
-            Self(counter)
-        }
-    }
-    impl Drop for TestSruct {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-
-    #[test]
-    fn test_teststruct() {
-        let counter = Arc::new(AtomicUsize::new(0));
-        const COUNTS: usize = 16;
-        let mut v = Vec::with_capacity(COUNTS);
-        for i in 0..COUNTS {
-            assert_eq!(counter.load(Ordering::SeqCst), i);
-            v.push(TestSruct::new(counter.clone()));
-        }
-        assert_eq!(counter.load(Ordering::SeqCst), COUNTS);
-        drop(v);
-        assert_eq!(counter.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn test_proper_drops() {
-        let counter = Arc::new(AtomicUsize::new(0));
-        const COUNTS: usize = 4096;
-
-        {
-            let (mut tx, _) = channel(COUNTS);
-            for i in 0..COUNTS {
-                assert_eq!(counter.load(Ordering::SeqCst), i);
-                tx.send(TestSruct::new(counter.clone()));
-            }
-            assert_eq!(counter.load(Ordering::SeqCst), COUNTS);
-        }
-        assert_eq!(counter.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -187,12 +152,12 @@ mod test {
 
             thread::spawn(move || {
                 for i in 0..COUNTS << 1 {
-                    futures::executor::block_on(tx.send_async(i));
+                    futures::executor::block_on(tx.send_async(i as QueueValue));
                 }
                 drop(tx);
             });
             for i in 0..COUNTS << 1 {
-                assert_eq!(rx.recv_async().await, i);
+                assert_eq!(rx.recv_async().await, i as QueueValue);
             }
         });
     }
@@ -203,15 +168,15 @@ mod test {
         let (mut tx, mut rx) = channel(COUNTS);
 
         thread::spawn(move || {
-            let v: Vec<u32> = (0..COUNTS as u32).collect();
+            let v: Vec<QueueValue> = (0..COUNTS).map(|i| i as QueueValue).collect();
             for _ in 0..COUNTS << 1 {
                 tx.batch_send_all(v.iter().copied());
             }
         });
 
         for _ in 0..COUNTS << 1 {
-            for i in 0..COUNTS as u32 {
-                assert_eq!(rx.recv(), i);
+            for i in 0..COUNTS {
+                assert_eq!(rx.recv(), i as QueueValue);
             }
         }
     }
@@ -224,7 +189,7 @@ mod test {
 
         thread::spawn(move || {
             for i in 0..(COUNTS << 8) + (COUNTS >> 1) + 1 {
-                tx.send(i);
+                tx.send(i as QueueValue);
             }
         });
 
@@ -233,7 +198,7 @@ mod test {
         while i < (COUNTS << 8) + (COUNTS >> 1) + 1 {
             rx.batch_recv(&mut buf, 128);
             for val in buf.drain(..) {
-                assert_eq!(i, val);
+                assert_eq!(i as QueueValue, val);
                 i += 1;
             }
         }
@@ -246,7 +211,7 @@ mod test {
             let (mut tx, mut rx) = channel(COUNTS);
 
             thread::spawn(move || {
-                let v: Vec<u32> = (0..200).collect();
+                let v: Vec<QueueValue> = (0..200).map(|i| i as QueueValue).collect();
                 for _ in 0..COUNTS << 1 {
                     futures::executor::block_on(tx.batch_send_all_async(v.clone().into_iter()));
                 }
@@ -254,7 +219,7 @@ mod test {
 
             for _ in 0..COUNTS << 1 {
                 for i in 0..200 {
-                    assert_eq!(rx.recv(), i);
+                    assert_eq!(rx.recv(), i as QueueValue);
                 }
             }
         });
@@ -268,7 +233,7 @@ mod test {
 
             thread::spawn(move || {
                 for i in 0..(COUNTS << 8) + (COUNTS >> 1) + 1 {
-                    tx.send(i);
+                    tx.send(i as QueueValue);
                 }
             });
 
@@ -277,7 +242,7 @@ mod test {
             while i < (COUNTS << 8) + (COUNTS >> 1) + 1 {
                 rx.batch_recv_async(&mut buf, 128).await;
                 for val in buf.drain(..) {
-                    assert_eq!(i, val);
+                    assert_eq!(i as QueueValue, val);
                     i += 1;
                 }
             }

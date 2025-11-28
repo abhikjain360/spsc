@@ -1,10 +1,10 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use gil::channel;
+use gil::{QueueValue, channel};
 use std::hint::black_box;
 use tokio::runtime::Runtime;
 
-async fn run_channel(capacity: usize, counts: u32) {
-    let (mut tx, mut rx) = channel::<u32>(capacity);
+async fn run_channel(capacity: usize, counts: QueueValue) {
+    let (mut tx, mut rx) = channel(capacity);
 
     tokio::spawn(async move {
         for i in 0..counts {
@@ -17,12 +17,12 @@ async fn run_channel(capacity: usize, counts: u32) {
     }
 }
 
-async fn run_channel_batch(capacity: usize, counts: u32) {
-    let (mut tx, mut rx) = channel::<u32>(capacity);
+async fn run_channel_batch(capacity: usize, counts: QueueValue) {
+    let (mut tx, mut rx) = channel(capacity);
     const BATCH_SIZE: usize = 128;
 
     tokio::spawn(async move {
-        let iter = (0..counts).map(black_box);
+        let iter = (0..counts).map(|i| black_box(i));
         tx.batch_send_all_async(iter).await;
     });
 
@@ -30,17 +30,19 @@ async fn run_channel_batch(capacity: usize, counts: u32) {
     let mut received = 0;
     while received < counts {
         let n = rx.batch_recv_async(&mut rx_vec, BATCH_SIZE).await;
-        received += n as u32;
+        received += n as QueueValue;
         rx_vec.clear();
     }
 }
 
 pub fn throughput_bench(c: &mut Criterion) {
     let runtime = Runtime::new().unwrap();
-    const COUNTS: u32 = 1_000_000;
+    const COUNTS: QueueValue = 1_000_000;
 
     let mut group = c.benchmark_group("async_throughput");
-    group.throughput(Throughput::Bytes(COUNTS as u64 * 4));
+    group.throughput(Throughput::Bytes(
+        COUNTS as u64 * size_of::<QueueValue>() as u64,
+    ));
     group.sample_size(50);
     group.measurement_time(std::time::Duration::from_secs(10));
 

@@ -7,22 +7,22 @@ use std::{
 
 use futures::Future;
 
-use crate::{Queue, sync::*};
+use crate::{Queue, QueueValue, sync::*};
 
-pub struct Receiver<T> {
-    buffer: NonNull<Queue<T>>,
+pub struct Receiver {
+    buffer: NonNull<Queue>,
     local_tail: usize,
 }
 
-impl<T> Receiver<T> {
-    pub(crate) fn new(buffer: NonNull<Queue<T>>) -> Self {
+impl Receiver {
+    pub(crate) fn new(buffer: NonNull<Queue>) -> Self {
         Self {
             buffer,
             local_tail: 0,
         }
     }
 
-    pub fn try_recv(&mut self) -> Option<T> {
+    pub fn try_recv(&mut self) -> Option<QueueValue> {
         // SAFETY: we are the only ones accessing it apart from other end which will not remove the
         // buffer, so its safe to derefernce.
         let buffer = unsafe { self.buffer.as_ref() };
@@ -40,12 +40,14 @@ impl<T> Receiver<T> {
         }
 
         #[cfg(not(loomer))]
-        let val =
-            unsafe { ((*Queue::elem(self.buffer.as_ptr(), cur_head)).get() as *const T).read() };
+        let val = unsafe {
+            ((*Queue::elem(self.buffer.as_ptr(), cur_head)).get() as *const QueueValue).read()
+        };
 
         #[cfg(loomer)]
         let val = unsafe {
-            (*Queue::elem(self.buffer.as_ptr(), cur_head)).with(|ptr| (ptr as *const T).read())
+            (*Queue::elem(self.buffer.as_ptr(), cur_head))
+                .with(|ptr| (ptr as *const QueueValue).read())
         };
 
         let mut new_head = cur_head + 1;
@@ -59,7 +61,7 @@ impl<T> Receiver<T> {
         Some(val)
     }
 
-    pub fn recv(&mut self) -> T {
+    pub fn recv(&mut self) -> QueueValue {
         // SAFETY: we are the only ones accessing it apart from other end which will not remove the
         // buffer, so its safe to derefernce.
         let buffer = unsafe { self.buffer.as_ref() };
@@ -83,12 +85,14 @@ impl<T> Receiver<T> {
         }
 
         #[cfg(not(loomer))]
-        let val =
-            unsafe { ((*Queue::elem(self.buffer.as_ptr(), cur_head)).get() as *const T).read() };
+        let val = unsafe {
+            ((*Queue::elem(self.buffer.as_ptr(), cur_head)).get() as *const QueueValue).read()
+        };
 
         #[cfg(loomer)]
         let val = unsafe {
-            (*Queue::elem(self.buffer.as_ptr(), cur_head)).with(|ptr| (ptr as *const T).read())
+            (*Queue::elem(self.buffer.as_ptr(), cur_head))
+                .with(|ptr| (ptr as *const QueueValue).read())
         };
 
         let mut new_head = cur_head + 1;
@@ -103,7 +107,7 @@ impl<T> Receiver<T> {
     }
 
     #[inline]
-    pub fn recv_async(&mut self) -> RecvFut<'_, T> {
+    pub fn recv_async(&mut self) -> RecvFut<'_> {
         RecvFut { receiver: self }
     }
 
@@ -112,7 +116,7 @@ impl<T> Receiver<T> {
         &'a mut self,
         buf: &'a mut I,
         limit: usize,
-    ) -> BatchRecvFut<'a, T, I> {
+    ) -> BatchRecvFut<'a, I> {
         BatchRecvFut {
             receiver: self,
             buf,
@@ -120,7 +124,7 @@ impl<T> Receiver<T> {
         }
     }
 
-    pub fn batch_recv(&mut self, buf: &mut impl iter::Extend<T>, limit: usize) -> usize {
+    pub fn batch_recv(&mut self, buf: &mut impl iter::Extend<QueueValue>, limit: usize) -> usize {
         // SAFETY: we are the only ones accessing it apart from other end which will not remove the
         // buffer, so its safe to derefernce.
         let buffer = unsafe { self.buffer.as_ref() };
@@ -141,12 +145,13 @@ impl<T> Receiver<T> {
 
             #[cfg(not(loomer))]
             let val = unsafe {
-                ((*Queue::elem(self.buffer.as_ptr(), cur_head)).get() as *const T).read()
+                ((*Queue::elem(self.buffer.as_ptr(), cur_head)).get() as *const QueueValue).read()
             };
 
             #[cfg(loomer)]
             let val = unsafe {
-                (*Queue::elem(self.buffer.as_ptr(), cur_head)).with(|ptr| (ptr as *const T).read())
+                (*Queue::elem(self.buffer.as_ptr(), cur_head))
+                    .with(|ptr| (ptr as *const QueueValue).read())
             };
 
             // TODO: change this to extend_one when it stabilizes
@@ -164,7 +169,7 @@ impl<T> Receiver<T> {
     }
 }
 
-impl<T> Drop for Receiver<T> {
+impl Drop for Receiver {
     fn drop(&mut self) {
         // SAFETY: we are the only ones accessing it apart from other end which should not drop the
         // buffer, so its safe to derefernce.
@@ -181,21 +186,21 @@ impl<T> Drop for Receiver<T> {
     }
 }
 
-pub struct RecvFut<'receiver, T> {
-    receiver: &'receiver mut Receiver<T>,
+pub struct RecvFut<'receiver> {
+    receiver: &'receiver mut Receiver,
 }
 
-impl<'receiver, T> RecvFut<'receiver, T> {
+impl<'receiver> RecvFut<'receiver> {
     #[inline]
-    fn project(self: Pin<&mut Self>) -> &mut Receiver<T> {
+    fn project(self: Pin<&mut Self>) -> &mut Receiver {
         // SAFETY: we should NEVER move out any values
         let me = unsafe { self.get_unchecked_mut() };
         me.receiver
     }
 }
 
-impl<'receiver, T> Future for RecvFut<'receiver, T> {
-    type Output = T;
+impl<'receiver> Future for RecvFut<'receiver> {
+    type Output = QueueValue;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let receiver = self.project();
@@ -209,24 +214,24 @@ impl<'receiver, T> Future for RecvFut<'receiver, T> {
     }
 }
 
-pub struct BatchRecvFut<'a, T, I> {
-    receiver: &'a mut Receiver<T>,
+pub struct BatchRecvFut<'a, I> {
+    receiver: &'a mut Receiver,
     buf: &'a mut I,
     limit: usize,
 }
 
-impl<'a, T, I> BatchRecvFut<'a, T, I> {
+impl<'a, I> BatchRecvFut<'a, I> {
     #[inline]
-    fn project(self: Pin<&mut Self>) -> (&mut Receiver<T>, &mut I, usize) {
+    fn project(self: Pin<&mut Self>) -> (&mut Receiver, &mut I, usize) {
         // SAFETY: we should NEVER move out any values
         let me = unsafe { self.get_unchecked_mut() };
         (me.receiver, me.buf, me.limit)
     }
 }
 
-impl<'a, T, I> Future for BatchRecvFut<'a, T, I>
+impl<'a, I> Future for BatchRecvFut<'a, I>
 where
-    I: iter::Extend<T>,
+    I: iter::Extend<QueueValue>,
 {
     type Output = usize;
 
@@ -244,4 +249,4 @@ where
 }
 
 // SAFETY: internal queue has atomic pointers to head and tails, and thus is safe to send
-unsafe impl<T: Send> Send for Receiver<T> {}
+unsafe impl Send for Receiver {}

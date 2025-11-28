@@ -7,22 +7,22 @@ use std::{
 
 use futures::Future;
 
-use crate::{Queue, sync::*};
+use crate::{Queue, QueueValue, sync::*};
 
-pub struct Sender<T> {
-    buffer: NonNull<Queue<T>>,
+pub struct Sender {
+    buffer: NonNull<Queue>,
     local_head: usize,
 }
 
-impl<T> Sender<T> {
-    pub(crate) fn new(buffer: NonNull<Queue<T>>) -> Self {
+impl Sender {
+    pub(crate) fn new(buffer: NonNull<Queue>) -> Self {
         Self {
             buffer,
             local_head: 0,
         }
     }
 
-    pub fn try_send(&mut self, val: T) -> Result<(), T> {
+    pub fn try_send(&mut self, val: QueueValue) -> Result<(), QueueValue> {
         // SAFETY: we are the only ones accessing it apart from other end which will not remove the
         // buffer, so its safe to derefernce.
         let buffer = unsafe { self.buffer.as_ref() };
@@ -43,13 +43,13 @@ impl<T> Sender<T> {
 
         #[cfg(not(loomer))]
         unsafe {
-            ((*Queue::elem(self.buffer.as_ptr(), cur_tail)).get() as *mut T).write(val);
+            ((*Queue::elem(self.buffer.as_ptr(), cur_tail)).get() as *mut QueueValue).write(val);
         }
 
         #[cfg(loomer)]
         unsafe {
             (*Queue::elem(self.buffer.as_ptr(), cur_tail))
-                .with_mut(|ptr| (ptr as *mut T).write(val));
+                .with_mut(|ptr| (ptr as *mut QueueValue).write(val));
         }
 
         // store is fine as we are the only ones writing to tail
@@ -58,7 +58,7 @@ impl<T> Sender<T> {
         Ok(())
     }
 
-    pub fn send(&mut self, val: T) {
+    pub fn send(&mut self, val: QueueValue) {
         // SAFETY: we are the only ones accessing it apart from other end which will not remove the
         // buffer, so its safe to derefernce.
         let buffer = unsafe { self.buffer.as_ref() };
@@ -87,27 +87,27 @@ impl<T> Sender<T> {
 
         #[cfg(not(loomer))]
         unsafe {
-            ((*Queue::elem(self.buffer.as_ptr(), cur_tail)).get() as *mut T).write(val);
+            ((*Queue::elem(self.buffer.as_ptr(), cur_tail)).get() as *mut QueueValue).write(val);
         }
 
         #[cfg(loomer)]
         unsafe {
             (*Queue::elem(self.buffer.as_ptr(), cur_tail))
-                .with_mut(|ptr| (ptr as *mut T).write(val));
+                .with_mut(|ptr| (ptr as *mut QueueValue).write(val));
         }
 
         buffer.tail.store(new_tail, Ordering::Release);
     }
 
     #[inline]
-    pub fn send_async(&mut self, val: T) -> SendFut<'_, T> {
+    pub fn send_async(&mut self, val: QueueValue) -> SendFut<'_> {
         SendFut {
             sender: self,
             to_send: Some(val),
         }
     }
 
-    pub fn batch_send(&mut self, vals: &mut impl Iterator<Item = T>) -> usize {
+    pub fn batch_send(&mut self, vals: &mut impl Iterator<Item = QueueValue>) -> usize {
         // SAFETY: we are the only ones accessing it apart from other end which will not remove the
         // buffer, so its safe to derefernce.
         let buffer = unsafe { self.buffer.as_ref() };
@@ -136,13 +136,14 @@ impl<T> Sender<T> {
 
             #[cfg(not(loomer))]
             unsafe {
-                ((*Queue::elem(self.buffer.as_ptr(), cur_tail)).get() as *mut T).write(val);
+                ((*Queue::elem(self.buffer.as_ptr(), cur_tail)).get() as *mut QueueValue)
+                    .write(val);
             }
 
             #[cfg(loomer)]
             unsafe {
                 (*Queue::elem(self.buffer.as_ptr(), cur_tail))
-                    .with_mut(|ptr| (ptr as *mut T).write(val));
+                    .with_mut(|ptr| (ptr as *mut QueueValue).write(val));
             }
 
             count += 1;
@@ -158,7 +159,7 @@ impl<T> Sender<T> {
         count
     }
 
-    pub fn batch_send_all(&mut self, vals: impl Iterator<Item = T>) {
+    pub fn batch_send_all(&mut self, vals: impl Iterator<Item = QueueValue>) {
         // SAFETY: we are the only ones accessing it apart from other end which will not remove the
         // buffer, so its safe to derefernce.
         let buffer = unsafe { self.buffer.as_ref() };
@@ -191,13 +192,14 @@ impl<T> Sender<T> {
 
             #[cfg(not(loomer))]
             unsafe {
-                ((*Queue::elem(self.buffer.as_ptr(), cur_tail)).get() as *mut T).write(val);
+                ((*Queue::elem(self.buffer.as_ptr(), cur_tail)).get() as *mut QueueValue)
+                    .write(val);
             }
 
             #[cfg(loomer)]
             unsafe {
                 (*Queue::elem(self.buffer.as_ptr(), cur_tail))
-                    .with_mut(|ptr| (ptr as *mut T).write(val));
+                    .with_mut(|ptr| (ptr as *mut QueueValue).write(val));
             }
 
             cur_tail = new_tail;
@@ -211,10 +213,10 @@ impl<T> Sender<T> {
     }
 
     #[inline]
-    pub fn batch_send_all_async<I: Iterator<Item = T>>(
+    pub fn batch_send_all_async<I: Iterator<Item = QueueValue>>(
         &mut self,
         vals: I,
-    ) -> BatchSendAllFut<'_, T, I> {
+    ) -> BatchSendAllFut<'_, I> {
         BatchSendAllFut {
             sender: self,
             iter: vals.peekable(),
@@ -223,7 +225,7 @@ impl<T> Sender<T> {
     }
 }
 
-impl<T> Drop for Sender<T> {
+impl Drop for Sender {
     fn drop(&mut self) {
         // SAFETY: we are the only ones accessing it apart from other end which should not drop the
         // buffer, so its safe to derefernce.
@@ -240,21 +242,21 @@ impl<T> Drop for Sender<T> {
     }
 }
 
-pub struct SendFut<'sender, T> {
-    sender: &'sender mut Sender<T>,
-    to_send: Option<T>,
+pub struct SendFut<'sender> {
+    sender: &'sender mut Sender,
+    to_send: Option<QueueValue>,
 }
 
-impl<'sender, T> SendFut<'sender, T> {
+impl<'sender> SendFut<'sender> {
     #[inline]
-    fn project(self: Pin<&mut Self>) -> (&mut Sender<T>, &mut Option<T>) {
+    fn project(self: Pin<&mut Self>) -> (&mut Sender, &mut Option<QueueValue>) {
         // SAFETY: we should NEVER move out any values
         let me = unsafe { self.get_unchecked_mut() };
         (me.sender, &mut me.to_send)
     }
 }
 
-impl<'sender, T> Future for SendFut<'sender, T> {
+impl<'sender> Future for SendFut<'sender> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -270,21 +272,21 @@ impl<'sender, T> Future for SendFut<'sender, T> {
     }
 }
 
-pub struct BatchSendAllFut<'sender, T, I: Iterator<Item = T>> {
-    sender: &'sender mut Sender<T>,
+pub struct BatchSendAllFut<'sender, I: Iterator<Item = QueueValue>> {
+    sender: &'sender mut Sender,
     iter: iter::Peekable<I>,
     total_count: usize,
 }
 
-impl<'sender, T, I: Iterator<Item = T>> BatchSendAllFut<'sender, T, I> {
-    fn project(self: Pin<&mut Self>) -> (&mut Sender<T>, &mut iter::Peekable<I>, &mut usize) {
+impl<'sender, I: Iterator<Item = QueueValue>> BatchSendAllFut<'sender, I> {
+    fn project(self: Pin<&mut Self>) -> (&mut Sender, &mut iter::Peekable<I>, &mut usize) {
         // SAFETY: we should NEVER move out any values
         let me = unsafe { self.get_unchecked_mut() };
         (me.sender, &mut me.iter, &mut me.total_count)
     }
 }
 
-impl<'sender, T, I: Iterator<Item = T>> Future for BatchSendAllFut<'sender, T, I> {
+impl<'sender, I: Iterator<Item = QueueValue>> Future for BatchSendAllFut<'sender, I> {
     type Output = usize;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -301,4 +303,4 @@ impl<'sender, T, I: Iterator<Item = T>> Future for BatchSendAllFut<'sender, T, I
 }
 
 // SAFETY: internal queue has atomic pointers to head and tails, and thus is safe to send
-unsafe impl<T: Send> Send for Sender<T> {}
+unsafe impl Send for Sender {}

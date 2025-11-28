@@ -3,7 +3,7 @@ use std::thread;
 use std::time::Instant;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use gil::channel;
+use gil::{QueueValue, channel};
 
 fn latency_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("latency");
@@ -11,8 +11,8 @@ fn latency_bench(c: &mut Criterion) {
     for capacity in [64, 512, 1024, 4096, 65536] {
         group.bench_function(format!("capacity_{}", capacity), |b| {
             b.iter_custom(|iters| {
-                let (mut tx1, mut rx1) = channel::<u64>(capacity);
-                let (mut tx2, mut rx2) = channel::<u64>(capacity);
+                let (mut tx1, mut rx1) = channel(capacity);
+                let (mut tx2, mut rx2) = channel(capacity);
 
                 let t = thread::spawn(move || {
                     for _ in 0..iters {
@@ -23,7 +23,7 @@ fn latency_bench(c: &mut Criterion) {
 
                 let start = Instant::now();
                 for i in 0..iters {
-                    tx1.send(black_box(i));
+                    tx1.send(black_box(i as QueueValue));
                     let val = rx2.recv();
                     black_box(val);
                 }

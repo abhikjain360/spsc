@@ -2,20 +2,20 @@
 use std::cell::UnsafeCell;
 use std::{
     alloc::{Layout, alloc, dealloc, handle_alloc_error},
-    mem::MaybeUninit,
+    mem::{MaybeUninit, size_of},
     ptr,
 };
 
 #[cfg(loomer)]
 use loom::cell::UnsafeCell;
 
-use crate::sync::*;
+use crate::{QueueValue, sync::*};
 
 #[cfg(not(loomer))]
-pub(crate) type BufferCell<T> = UnsafeCell<MaybeUninit<T>>;
+pub(crate) type BufferCell = UnsafeCell<MaybeUninit<QueueValue>>;
 
 #[cfg(loomer)]
-pub(crate) type BufferCell<T> = loom::cell::UnsafeCell<MaybeUninit<T>>;
+pub(crate) type BufferCell = loom::cell::UnsafeCell<MaybeUninit<QueueValue>>;
 
 #[cfg(target_arch = "x86_64")]
 const CACHE_LINE_SIZE: usize = 64;
@@ -29,7 +29,7 @@ const CACHE_LINE_SIZE: usize = 128;
 /// - tail is invalid, where we add next value
 #[cfg_attr(target_arch = "aarch64", repr(C, align(128)))]
 #[cfg_attr(target_arch = "x86_64", repr(C, align(64)))]
-pub(crate) struct Queue<T> {
+pub(crate) struct Queue {
     pub(crate) head: AtomicUsize,
     _pad1: [u8; CACHE_LINE_SIZE - size_of::<AtomicUsize>()],
     pub(crate) tail: AtomicUsize,
@@ -37,10 +37,10 @@ pub(crate) struct Queue<T> {
     pub(crate) rc: AtomicUsize,
     pub(crate) capacity: usize,
     _pad3: [u8; CACHE_LINE_SIZE - size_of::<AtomicUsize>() - size_of::<usize>()],
-    pub(crate) buffer: [BufferCell<T>; 0],
+    pub(crate) buffer: [BufferCell; 0],
 }
 
-impl<T> Queue<T> {
+impl Queue {
     #[inline]
     pub(crate) fn with_capacity(capacity: usize) -> ptr::NonNull<Self> {
         let capacity = capacity + 1;
@@ -58,7 +58,7 @@ impl<T> Queue<T> {
             ptr::addr_of_mut!((*ptr).capacity).write(capacity);
 
             // Initialize buffer elements
-            let buffer_ptr = ptr::addr_of_mut!((*ptr).buffer) as *mut BufferCell<T>;
+            let buffer_ptr = ptr::addr_of_mut!((*ptr).buffer) as *mut BufferCell;
             for i in 0..capacity {
                 buffer_ptr
                     .add(i)
@@ -72,23 +72,23 @@ impl<T> Queue<T> {
     #[inline]
     pub(crate) fn layout(capacity: usize) -> Layout {
         let header = Layout::new::<Self>();
-        let array = Layout::array::<BufferCell<T>>(capacity).unwrap();
+        let array = Layout::array::<BufferCell>(capacity).unwrap();
         header.extend(array).unwrap().0.pad_to_align()
     }
 
     #[inline]
-    pub(crate) unsafe fn elem(ptr: *mut Self, idx: usize) -> *const BufferCell<T> {
+    pub(crate) unsafe fn elem(ptr: *mut Self, idx: usize) -> *const BufferCell {
         unsafe {
-            let ptr = (ptr as *mut u8).add(std::mem::size_of::<Self>()) as *const BufferCell<T>;
+            let ptr = (ptr as *mut u8).add(std::mem::size_of::<Self>()) as *const BufferCell;
             ptr.add(idx)
         }
     }
 
     #[cfg(loomer)]
     #[inline]
-    pub(crate) unsafe fn elem_mut(ptr: *mut Self, idx: usize) -> *mut BufferCell<T> {
+    pub(crate) unsafe fn elem_mut(ptr: *mut Self, idx: usize) -> *mut BufferCell {
         unsafe {
-            let ptr = (ptr as *mut u8).add(std::mem::size_of::<Self>()) as *mut BufferCell<T>;
+            let ptr = (ptr as *mut u8).add(std::mem::size_of::<Self>()) as *mut BufferCell;
             ptr.add(idx)
         }
     }
@@ -106,7 +106,7 @@ impl<T> Queue<T> {
             // SAFETY: we own all the existing values in the queue.
             #[cfg(not(loomer))]
             unsafe {
-                ptr::drop_in_place((*Self::elem(ptr.as_ptr(), head)).get().cast::<T>());
+                ptr::drop_in_place((*Self::elem(ptr.as_ptr(), head)).get().cast::<QueueValue>());
             }
             #[cfg(loomer)]
             unsafe {

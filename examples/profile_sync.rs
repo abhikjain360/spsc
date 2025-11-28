@@ -1,4 +1,4 @@
-use gil::channel;
+use gil::{QueueValue, channel};
 use std::thread;
 use std::time::Instant;
 
@@ -6,18 +6,18 @@ fn main() {
     const CAPACITY: usize = 1024; // Power of 2
     const ITERATIONS: usize = 100_000_000;
 
-    let (mut tx, mut rx) = channel::<u64>(CAPACITY);
+    let (mut tx, mut rx) = channel(CAPACITY);
 
     let start = Instant::now();
 
     let p = thread::spawn(move || {
         for i in 0..ITERATIONS {
-            tx.send(i as u64);
+            tx.send(i as QueueValue);
         }
     });
 
     let c = thread::spawn(move || {
-        let mut sum: u64 = 0;
+        let mut sum: QueueValue = 0;
         for _ in 0..ITERATIONS {
             sum = sum.wrapping_add(rx.recv());
         }
