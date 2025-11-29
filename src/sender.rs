@@ -92,7 +92,7 @@ impl Sender {
                         self.local_head = new_val;
                         break;
                     }
-                    std::hint::spin_loop();
+                    hint::spin_loop();
                 }
 
                 // PHASE 2: Power-Saving Wait (WFE)
@@ -163,7 +163,7 @@ impl Sender {
                         self.local_head = new_val;
                         break;
                     }
-                    std::hint::spin_loop();
+                    hint::spin_loop();
                 }
 
                 // PHASE 2: Power-Saving Wait (WFE)
@@ -242,7 +242,7 @@ impl Sender {
                             self.local_head = new_val;
                             break;
                         }
-                        std::hint::spin_loop();
+                        hint::spin_loop();
                     }
 
                     // PHASE 2: Power-Saving Wait (WFE)

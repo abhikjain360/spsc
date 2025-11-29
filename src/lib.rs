@@ -65,20 +65,20 @@ pub use sender::Sender;
 use sync::*;
 
 /// Wait For Event - puts the core into a low-power state until an event occurs.
-/// On non-aarch64, this is a no-op.
+/// On non-aarch64, loom, or miri, this is a no-op.
 #[inline(always)]
 pub(crate) fn wfe() {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(loomer), not(miri)))]
     unsafe {
         core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
     }
 }
 
 /// Send Event - wakes up cores waiting in WFE state.
-/// On non-aarch64, this is a no-op.
+/// On non-aarch64, loom, or miri, this is a no-op.
 #[inline(always)]
 pub(crate) fn sev() {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(loomer), not(miri)))]
     unsafe {
         core::arch::asm!("sev", options(nomem, nostack, preserves_flags));
     }

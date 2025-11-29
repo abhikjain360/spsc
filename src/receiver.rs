@@ -96,7 +96,7 @@ impl Receiver {
                         self.local_tail = new_val;
                         break;
                     }
-                    std::hint::spin_loop();
+                    hint::spin_loop();
                 }
 
                 // PHASE 2: Power-Saving Wait (WFE)
