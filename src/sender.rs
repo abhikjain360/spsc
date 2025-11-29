@@ -1,5 +1,6 @@
 use std::{
-    iter,
+    cmp, iter,
+    mem::MaybeUninit,
     pin::Pin,
     ptr::NonNull,
     task::{Context, Poll},
@@ -7,7 +8,7 @@ use std::{
 
 use futures::Future;
 
-use crate::{Queue, QueueValue, sync::*};
+use crate::{Queue, QueueValue, sev, sync::*, wfe};
 
 pub struct Sender {
     buffer: NonNull<Queue>,
@@ -41,6 +42,9 @@ impl Sender {
             }
         }
 
+        // CONDITIONAL SIGNALING: Check if buffer was empty BEFORE this write
+        let was_empty = cur_tail == self.local_head;
+
         #[cfg(not(loomer))]
         unsafe {
             ((*Queue::elem(self.buffer.as_ptr(), cur_tail)).get() as *mut QueueValue).write(val);
@@ -54,6 +58,11 @@ impl Sender {
 
         // store is fine as we are the only ones writing to tail
         buffer.tail.store(new_tail, Ordering::Release);
+
+        // Only wake consumer if buffer was previously empty (consumer might be sleeping)
+        if was_empty {
+            sev();
+        }
 
         Ok(())
     }
@@ -72,18 +81,36 @@ impl Sender {
         if self.local_head == new_tail {
             self.local_head = buffer.head.load(Ordering::Acquire);
 
-            let mut spin_count = 0;
-            while self.local_head == new_tail {
-                if spin_count > 100 {
-                    thread::yield_now();
-                    spin_count = 0;
-                } else {
-                    hint::spin_loop();
-                    spin_count += 1;
+            if self.local_head == new_tail {
+                // PHASE 1: Optimistic Spin (Hot Potato)
+                // Spin for a short time to catch immediate updates.
+                // 100 iterations is usually enough to cover the cross-core latency (~40-80ns)
+                // without burning excessive CPU.
+                for _ in 0..1000 {
+                    let new_val = buffer.head.load(Ordering::Acquire);
+                    if new_val != self.local_head {
+                        self.local_head = new_val;
+                        break;
+                    }
+                    std::hint::spin_loop();
                 }
-                self.local_head = buffer.head.load(Ordering::Acquire);
+
+                // PHASE 2: Power-Saving Wait (WFE)
+                // If we waited 100 spins and nothing happened, the other thread
+                // is likely busy or descheduled. Sleep until signalled.
+                while self.local_head == new_tail {
+                    let new_val = buffer.head.load(Ordering::Acquire);
+                    if new_val != self.local_head {
+                        self.local_head = new_val;
+                        break;
+                    }
+                    wfe();
+                }
             }
         }
+
+        // CONDITIONAL SIGNALING: Check if buffer was empty BEFORE this write
+        let was_empty = cur_tail == self.local_head;
 
         #[cfg(not(loomer))]
         unsafe {
@@ -97,6 +124,11 @@ impl Sender {
         }
 
         buffer.tail.store(new_tail, Ordering::Release);
+
+        // Only wake consumer if buffer was previously empty (consumer might be sleeping)
+        if was_empty {
+            sev();
+        }
     }
 
     #[inline]
@@ -119,13 +151,30 @@ impl Sender {
             new_tail = 0;
         }
 
+        // Track if buffer was empty at the start
+        let was_empty_at_start = cur_tail == self.local_head;
+
         loop {
             if self.local_head == new_tail {
-                buffer.tail.store(cur_tail, Ordering::Release);
+                // PHASE 1: Optimistic Spin (Hot Potato)
+                for _ in 0..100 {
+                    let new_val = buffer.head.load(Ordering::Acquire);
+                    if new_val != self.local_head {
+                        self.local_head = new_val;
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
 
-                self.local_head = buffer.head.load(Ordering::Acquire);
+                // PHASE 2: Power-Saving Wait (WFE)
                 if self.local_head == new_tail {
-                    return count;
+                    wfe();
+                    buffer.tail.store(cur_tail, Ordering::Release);
+
+                    self.local_head = buffer.head.load(Ordering::Acquire);
+                    if self.local_head == new_tail {
+                        return count;
+                    }
                 }
             }
 
@@ -156,6 +205,12 @@ impl Sender {
         }
 
         buffer.tail.store(cur_tail, Ordering::Release);
+
+        // Only wake consumer if buffer was empty when we started
+        if was_empty_at_start {
+            sev();
+        }
+
         count
     }
 
@@ -170,23 +225,35 @@ impl Sender {
             new_tail = 0;
         }
 
+        // Track if buffer was empty at the start
+        let was_empty_at_start = cur_tail == self.local_head;
+
         for val in vals {
             if self.local_head == new_tail {
                 buffer.tail.store(cur_tail, Ordering::Release);
 
                 self.local_head = buffer.head.load(Ordering::Acquire);
 
-                let mut spin_count = 0;
-                while self.local_head == new_tail {
-                    if spin_count > 100 {
-                        thread::yield_now();
-                        spin_count = 0;
-                    } else {
-                        hint::spin_loop();
-                        spin_count += 1;
+                if self.local_head == new_tail {
+                    // PHASE 1: Optimistic Spin (Hot Potato)
+                    for _ in 0..100 {
+                        let new_val = buffer.head.load(Ordering::Acquire);
+                        if new_val != self.local_head {
+                            self.local_head = new_val;
+                            break;
+                        }
+                        std::hint::spin_loop();
                     }
 
-                    self.local_head = buffer.head.load(Ordering::Acquire);
+                    // PHASE 2: Power-Saving Wait (WFE)
+                    while self.local_head == new_tail {
+                        let new_val = buffer.head.load(Ordering::Acquire);
+                        if new_val != self.local_head {
+                            self.local_head = new_val;
+                            break;
+                        }
+                        wfe();
+                    }
                 }
             }
 
@@ -210,6 +277,11 @@ impl Sender {
         }
 
         buffer.tail.store(cur_tail, Ordering::Release);
+
+        // Only wake consumer if buffer was empty when we started
+        if was_empty_at_start {
+            sev();
+        }
     }
 
     #[inline]
@@ -222,6 +294,123 @@ impl Sender {
             iter: vals.peekable(),
             total_count: 0,
         }
+    }
+
+    /// Returns a mutable slice of available space in the buffer for zero-copy writes.
+    ///
+    /// This method provides direct access to the ring buffer's internal memory,
+    /// allowing you to write data without intermediate copies. The slice represents
+    /// contiguous available space in the buffer.
+    ///
+    /// After writing to the slice, you must call `commit()` to make the data visible
+    /// to the receiver.
+    ///
+    /// Returns an empty slice if the buffer is full.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gil::channel;
+    /// use std::ptr;
+    ///
+    /// let (mut tx, mut rx) = channel(128);
+    ///
+    /// // Get writable slice
+    /// let slice = tx.get_write_slice();
+    /// let data = [1u128, 2, 3, 4];
+    /// let count = data.len().min(slice.len());
+    /// if !slice.is_empty() {
+    ///     // Write data directly
+    ///     unsafe {
+    ///         ptr::copy_nonoverlapping(
+    ///             data.as_ptr() as *const std::mem::MaybeUninit<_>,
+    ///             slice.as_mut_ptr(),
+    ///             count
+    ///         );
+    ///     }
+    /// }
+    /// tx.commit(count);
+    /// ```
+    #[inline(always)]
+    pub fn get_write_slice(&mut self) -> &mut [MaybeUninit<QueueValue>] {
+        let buffer = unsafe { self.buffer.as_ref() };
+        let tail = buffer.tail.load(Ordering::Relaxed);
+
+        // Check if we need to refresh local_head
+        let occupied = if tail >= self.local_head {
+            tail - self.local_head
+        } else {
+            buffer.capacity - (self.local_head - tail)
+        };
+
+        if occupied >= buffer.capacity - 1 {
+            // Refresh head to see if consumer moved
+            self.local_head = buffer.head.load(Ordering::Acquire);
+
+            let occupied = if tail >= self.local_head {
+                tail - self.local_head
+            } else {
+                buffer.capacity - (self.local_head - tail)
+            };
+
+            if occupied >= buffer.capacity - 1 {
+                return &mut []; // Full
+            }
+        }
+
+        // Calculate contiguous available space
+        let available_total = buffer.capacity - 1 - occupied;
+        let contiguous_space = buffer.capacity - tail;
+
+        // We can only give the contiguous part
+        let len = cmp::min(contiguous_space, available_total);
+
+        unsafe {
+            let ptr = Queue::elem(self.buffer.as_ptr(), tail) as *mut MaybeUninit<QueueValue>;
+            std::slice::from_raw_parts_mut(ptr as *mut MaybeUninit<QueueValue>, len)
+        }
+    }
+
+    /// Commits `count` items that were written to the slice obtained from `get_write_slice()`.
+    ///
+    /// This makes the written data visible to the receiver. You must call this after
+    /// writing to the slice, otherwise the receiver won't see your data.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `count` items have been properly initialized in the
+    /// slice obtained from `get_write_slice()`. The count must not exceed the length
+    /// of the slice that was returned.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gil::channel;
+    ///
+    /// let (mut tx, mut rx) = channel(128);
+    /// let slice = tx.get_write_slice();
+    /// let count = slice.len().min(10);
+    /// for i in 0..count {
+    ///     slice[i].write(i as u128);
+    /// }
+    /// tx.commit(count);
+    /// ```
+    #[inline(always)]
+    pub fn commit(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+
+        let buffer = unsafe { self.buffer.as_ref() };
+        let tail = buffer.tail.load(Ordering::Relaxed);
+        let mut new_tail = tail + count;
+        if new_tail >= buffer.capacity {
+            new_tail -= buffer.capacity;
+        }
+
+        buffer.tail.store(new_tail, Ordering::Release);
+
+        sev();
     }
 }
 

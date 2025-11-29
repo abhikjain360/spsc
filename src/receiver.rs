@@ -1,5 +1,5 @@
 use std::{
-    iter,
+    cmp, iter,
     pin::Pin,
     ptr::NonNull,
     task::{Context, Poll},
@@ -7,7 +7,7 @@ use std::{
 
 use futures::Future;
 
-use crate::{Queue, QueueValue, sync::*};
+use crate::{Queue, QueueValue, sev, sync::*, wfe};
 
 pub struct Receiver {
     buffer: NonNull<Queue>,
@@ -55,8 +55,22 @@ impl Receiver {
             new_head = 0;
         }
 
+        // CONDITIONAL SIGNALING: Check if buffer was full BEFORE this read
+        // Calculate occupied slots before the read
+        let occupied = if self.local_tail >= cur_head {
+            self.local_tail - cur_head
+        } else {
+            buffer.capacity - (cur_head - self.local_tail)
+        };
+        let was_full = occupied >= buffer.capacity - 1;
+
         // this is fine as we are the only ones writing to head
         buffer.head.store(new_head, Ordering::Release);
+
+        // Only wake producer if buffer was previously full (producer might be sleeping)
+        if was_full {
+            sev();
+        }
 
         Some(val)
     }
@@ -71,16 +85,31 @@ impl Receiver {
         if cur_head == self.local_tail {
             self.local_tail = buffer.tail.load(Ordering::Acquire);
 
-            let mut spin_count = 0;
-            while cur_head == self.local_tail {
-                if spin_count > 100 {
-                    thread::yield_now();
-                    spin_count = 0;
-                } else {
-                    hint::spin_loop();
-                    spin_count += 1;
+            if cur_head == self.local_tail {
+                // PHASE 1: Optimistic Spin (Hot Potato)
+                // Spin for a short time to catch immediate updates.
+                // 100 iterations is usually enough to cover the cross-core latency (~40-80ns)
+                // without burning excessive CPU.
+                for _ in 0..1000 {
+                    let new_val = buffer.tail.load(Ordering::Acquire);
+                    if new_val != self.local_tail {
+                        self.local_tail = new_val;
+                        break;
+                    }
+                    std::hint::spin_loop();
                 }
-                self.local_tail = buffer.tail.load(Ordering::Acquire);
+
+                // PHASE 2: Power-Saving Wait (WFE)
+                // If we waited 100 spins and nothing happened, the other thread
+                // is likely busy or descheduled. Sleep until signalled.
+                while cur_head == self.local_tail {
+                    let new_val = buffer.tail.load(Ordering::Acquire);
+                    if new_val != self.local_tail {
+                        self.local_tail = new_val;
+                        break;
+                    }
+                    wfe();
+                }
             }
         }
 
@@ -100,8 +129,22 @@ impl Receiver {
             new_head = 0;
         }
 
+        // CONDITIONAL SIGNALING: Check if buffer was full BEFORE this read
+        // Calculate occupied slots before the read
+        let occupied = if self.local_tail >= cur_head {
+            self.local_tail - cur_head
+        } else {
+            buffer.capacity - (cur_head - self.local_tail)
+        };
+        let was_full = occupied >= buffer.capacity - 1;
+
         // this is fine as we are the only ones writing to head
         buffer.head.store(new_head, Ordering::Release);
+
+        // Only wake producer if buffer was previously full (producer might be sleeping)
+        if was_full {
+            sev();
+        }
 
         val
     }
@@ -131,6 +174,14 @@ impl Receiver {
         let mut count = 0;
 
         let mut cur_head = buffer.head.load(Ordering::Relaxed);
+
+        // Track if buffer was full at the start
+        let occupied_at_start = if self.local_tail >= cur_head {
+            self.local_tail - cur_head
+        } else {
+            buffer.capacity - (cur_head - self.local_tail)
+        };
+        let was_full_at_start = occupied_at_start >= buffer.capacity - 1;
 
         while count < limit {
             if cur_head == self.local_tail {
@@ -165,7 +216,110 @@ impl Receiver {
         }
 
         buffer.head.store(cur_head, Ordering::Release);
+
+        // Only wake producer if buffer was full when we started
+        if was_full_at_start {
+            sev();
+        }
+
         count
+    }
+
+    /// Returns a slice of available data to read for zero-copy reads.
+    ///
+    /// This method provides direct access to the ring buffer's internal memory,
+    /// allowing you to read data without intermediate copies. The slice represents
+    /// contiguous available data in the buffer.
+    ///
+    /// After reading from the slice, you must call `advance()` to move the read
+    /// position forward.
+    ///
+    /// Returns an empty slice if the buffer is empty.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gil::channel;
+    /// use std::hint::black_box;
+    ///
+    /// let (mut tx, mut rx) = channel(128);
+    /// tx.send(42);
+    ///
+    /// // Get readable slice
+    /// let slice = rx.get_read_slice();
+    /// let len = slice.len();
+    /// if !slice.is_empty() {
+    ///     // Process data directly from the buffer
+    ///     black_box(slice[0]);
+    /// }
+    /// rx.advance(len);
+    /// ```
+    #[inline(always)]
+    pub fn get_read_slice(&mut self) -> &[QueueValue] {
+        let buffer = unsafe { self.buffer.as_ref() };
+        let head = buffer.head.load(Ordering::Relaxed);
+
+        if head == self.local_tail {
+            self.local_tail = buffer.tail.load(Ordering::Acquire);
+            if head == self.local_tail {
+                return &[]; // Empty
+            }
+        }
+
+        // Calculate available data
+        let available_total = if self.local_tail >= head {
+            self.local_tail - head
+        } else {
+            buffer.capacity - (head - self.local_tail)
+        };
+
+        let contiguous_data = buffer.capacity - head;
+        let len = cmp::min(contiguous_data, available_total);
+
+        unsafe {
+            let ptr = Queue::elem(self.buffer.as_ptr(), head) as *const QueueValue;
+            std::slice::from_raw_parts(ptr, len)
+        }
+    }
+
+    /// Advances the read position by `count` items.
+    ///
+    /// This must be called after reading data from the slice obtained from
+    /// `get_read_slice()` to make the space available to the sender again.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `count` does not exceed the length of the
+    /// slice that was returned by the last `get_read_slice()` call.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gil::channel;
+    ///
+    /// let (mut tx, mut rx) = channel(128);
+    /// tx.send(42);
+    ///
+    /// let slice = rx.get_read_slice();
+    /// let count = slice.len();
+    /// // Process slice...
+    /// rx.advance(count);
+    /// ```
+    #[inline(always)]
+    pub fn advance(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+
+        let buffer = unsafe { self.buffer.as_ref() };
+        let head = buffer.head.load(Ordering::Relaxed);
+        let mut new_head = head + count;
+        if new_head >= buffer.capacity {
+            new_head -= buffer.capacity;
+        }
+
+        buffer.head.store(new_head, Ordering::Release);
+        sev()
     }
 }
 

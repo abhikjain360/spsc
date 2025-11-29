@@ -1,4 +1,4 @@
-use std::{hint::black_box, thread};
+use std::{hint::black_box, mem::MaybeUninit, ptr, thread};
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use gil::{QueueValue, channel};
@@ -34,6 +34,62 @@ fn run_channel_batch(capacity: usize, counts: QueueValue, batch_size: usize) {
     }
 }
 
+fn run_channel_zerocopy(capacity: usize, counts: QueueValue, batch_size: usize) {
+    let (mut tx, mut rx) = channel(capacity);
+
+    thread::spawn(move || {
+        let mut remaining = counts;
+        let dummy_data = [123u128; 128]; // Source data
+
+        while remaining > 0 {
+            let slice = tx.get_write_slice();
+            if slice.is_empty() {
+                #[cfg(target_arch = "aarch64")]
+                unsafe {
+                    core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
+                }
+                continue;
+            }
+
+            let batch = remaining.min(slice.len() as QueueValue);
+            let batch = batch.min(batch_size as QueueValue) as usize;
+
+            // MEMCPY! This is what gets you high GB/s
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    dummy_data.as_ptr() as *const MaybeUninit<QueueValue>,
+                    slice.as_mut_ptr(),
+                    batch,
+                );
+            }
+
+            tx.commit(batch);
+            remaining -= batch as QueueValue;
+        }
+    });
+
+    let mut received = 0;
+    while received < counts {
+        let len = {
+            let slice = rx.get_read_slice();
+            if slice.is_empty() {
+                #[cfg(target_arch = "aarch64")]
+                unsafe {
+                    core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
+                }
+                continue;
+            }
+
+            // Just touch the memory to ensure we read it
+            let _ = black_box(slice[0]);
+            slice.len()
+        };
+
+        rx.advance(len);
+        received += len as QueueValue;
+    }
+}
+
 pub fn throughput_bench(c: &mut Criterion) {
     const COUNTS: QueueValue = 1_000_000;
     const BATCH_SIZE: usize = 128;
@@ -51,6 +107,9 @@ pub fn throughput_bench(c: &mut Criterion) {
         });
         group.bench_function(format!("batch_capacity_{}", capacity), |b| {
             b.iter(|| run_channel_batch(capacity, COUNTS, BATCH_SIZE))
+        });
+        group.bench_function(format!("zerocopy_capacity_{}", capacity), |b| {
+            b.iter(|| run_channel_zerocopy(capacity, COUNTS, BATCH_SIZE))
         });
     }
     group.finish();
