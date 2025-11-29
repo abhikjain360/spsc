@@ -4,6 +4,8 @@
 
 Inspired by [Facebook's folly's ProducerConsumerQueue](https://github.com/facebook/folly/blob/main/folly/ProducerConsumerQueue.h).
 
+> ⚠️ WIP: things **WILL** change a lot without warnings even in minor updates until v1, use at your own risk.
+
 ## Features
 
 - **Lock-free**: Uses atomic operations for synchronization
