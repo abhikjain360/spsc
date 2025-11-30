@@ -40,9 +40,10 @@ pub fn throughput_bench(c: &mut Criterion) {
     const COUNTS: QueueValue = 1_000_000;
 
     let mut group = c.benchmark_group("async_throughput");
-    group.throughput(Throughput::Bytes(
-        COUNTS as u64 * size_of::<QueueValue>() as u64,
-    ));
+    group.throughput(Throughput::ElementsAndBytes {
+        elements: COUNTS as u64,
+        bytes: size_of::<QueueValue>() as u64 * COUNTS as u64,
+    });
     group.sample_size(50);
     group.measurement_time(std::time::Duration::from_secs(10));
 

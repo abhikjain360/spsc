@@ -44,10 +44,6 @@ fn run_channel_zerocopy(capacity: usize, counts: QueueValue, batch_size: usize) 
         while remaining > 0 {
             let slice = tx.get_write_slice();
             if slice.is_empty() {
-                #[cfg(target_arch = "aarch64")]
-                unsafe {
-                    core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
-                }
                 continue;
             }
 
@@ -69,10 +65,6 @@ fn run_channel_zerocopy(capacity: usize, counts: QueueValue, batch_size: usize) 
         let len = {
             let slice = rx.get_read_slice();
             if slice.is_empty() {
-                #[cfg(target_arch = "aarch64")]
-                unsafe {
-                    core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
-                }
                 continue;
             }
 
@@ -91,9 +83,10 @@ pub fn throughput_bench(c: &mut Criterion) {
     const BATCH_SIZE: usize = 128;
 
     let mut group = c.benchmark_group("throughput");
-    group.throughput(Throughput::Bytes(
-        COUNTS as u64 * size_of::<QueueValue>() as u64,
-    ));
+    group.throughput(Throughput::ElementsAndBytes {
+        elements: COUNTS as u64,
+        bytes: size_of::<QueueValue>() as u64 * COUNTS as u64,
+    });
     group.sample_size(50); // Reduce sample size to keep total time down while increasing per-iter work
     group.measurement_time(std::time::Duration::from_secs(10));
 

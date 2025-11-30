@@ -3,7 +3,7 @@ use std::ptr;
 use std::thread;
 use std::time::Instant;
 
-const CAPACITY: usize = 1 << 16; // Power of 2
+const CAPACITY: usize = 1 << 12; // Power of 2
 const ITERATIONS: usize = 100_000_000;
 
 fn run() {
@@ -43,10 +43,6 @@ fn run() {
         while remaining > 0 {
             let slice = tx.get_write_slice();
             if slice.is_empty() {
-                #[cfg(target_arch = "aarch64")]
-                unsafe {
-                    core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
-                }
                 continue;
             }
 
@@ -67,10 +63,6 @@ fn run() {
         let len = {
             let slice = rx.get_read_slice();
             if slice.is_empty() {
-                #[cfg(target_arch = "aarch64")]
-                unsafe {
-                    core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
-                }
                 continue;
             }
 

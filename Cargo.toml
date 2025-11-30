@@ -1,6 +1,6 @@
 [package]
 name = "gil"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 authors = ["Abhik Jain <abhik@abhikjain.xyz>"]
 description = "A fast single-producer single-consumer queue with sync and async support"
@@ -17,7 +17,7 @@ exclude = [".lazy.lua"]
 futures = "0.3.31"
 
 [dev-dependencies]
-criterion = { version = "0.7.0", features = ["async_tokio", "html_reports"] }
+criterion = { version = "0.8.0", features = ["async_tokio", "html_reports"] }
 tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
 
 # using 'loomer' in cfg because otherwise conflicts with tokio's internal use of 'loom' and fails
@@ -34,14 +34,6 @@ harness = false
 
 [[bench]]
 name = "throughput_async"
-harness = false
-
-[[bench]]
-name = "ops"
-harness = false
-
-[[bench]]
-name = "ops_async"
 harness = false
 
 [[bench]]
