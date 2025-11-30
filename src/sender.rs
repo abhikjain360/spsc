@@ -167,13 +167,21 @@ impl Sender {
             self.local_head = buffer.head.load(Ordering::Acquire);
 
             if self.local_head == new_tail {
+                let mut spin_count = 0_u8;
                 while self.local_head == new_tail {
                     let new_val = buffer.head.load(Ordering::Acquire);
                     if new_val != self.local_head {
                         self.local_head = new_val;
                         break;
                     }
-                    std::thread::yield_now();
+
+                    if spin_count < 100 {
+                        spin_count += 1;
+                        hint::spin_loop();
+                    } else {
+                        spin_count = 0;
+                        thread::yield_now();
+                    }
                 }
             }
         }

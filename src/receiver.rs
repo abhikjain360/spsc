@@ -158,17 +158,30 @@ impl Receiver {
 
         let cur_head = buffer.head.load(Ordering::Relaxed);
 
+        let mut new_head = cur_head + 1;
+        if new_head == buffer.capacity {
+            new_head = 0;
+        }
+
         if cur_head == self.local_tail {
             self.local_tail = buffer.tail.load(Ordering::Acquire);
 
             if cur_head == self.local_tail {
+                let mut spin_count = 0_u8;
                 while cur_head == self.local_tail {
                     let new_val = buffer.tail.load(Ordering::Acquire);
                     if new_val != self.local_tail {
                         self.local_tail = new_val;
                         break;
                     }
-                    std::thread::yield_now();
+
+                    if spin_count < 100 {
+                        spin_count += 1;
+                        hint::spin_loop();
+                    } else {
+                        spin_count = 0;
+                        thread::yield_now();
+                    }
                 }
             }
         }
@@ -183,11 +196,6 @@ impl Receiver {
             (*Queue::elem(self.buffer.as_ptr(), cur_head))
                 .with(|ptr| (ptr as *const QueueValue).read())
         };
-
-        let mut new_head = cur_head + 1;
-        if new_head == buffer.capacity {
-            new_head = 0;
-        }
 
         // this is fine as we are the only ones writing to head
         buffer.head.store(new_head, Ordering::Release);
