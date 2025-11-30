@@ -1,3 +1,8 @@
+//! Internal queue implementation for the SPSC channel.
+//!
+//! This module contains the low-level ring buffer implementation that powers
+//! both the synchronous and asynchronous channel operations.
+
 #[cfg(not(loomer))]
 use std::cell::UnsafeCell;
 use std::{
@@ -11,36 +16,99 @@ use loom::cell::UnsafeCell;
 
 use crate::{QueueValue, sync::*};
 
+/// Type alias for buffer cells, conditionally using loom's UnsafeCell for testing.
 #[cfg(not(loomer))]
 pub(crate) type BufferCell = UnsafeCell<MaybeUninit<QueueValue>>;
 
+/// Type alias for buffer cells when using loom for concurrency testing.
 #[cfg(loomer)]
 pub(crate) type BufferCell = loom::cell::UnsafeCell<MaybeUninit<QueueValue>>;
 
+/// Cache line size for x86_64 architectures (64 bytes).
 #[cfg(target_arch = "x86_64")]
 const CACHE_LINE_SIZE: usize = 64;
+
+/// Cache line size for aarch64 architectures (128 bytes).
 #[cfg(target_arch = "aarch64")]
 const CACHE_LINE_SIZE: usize = 128;
 
-/// The inner queue used by `Sender` and `Receiver`.
+/// The internal lock-free ring buffer used by `Sender` and `Receiver`.
+///
+/// This structure is carefully aligned to cache line boundaries to prevent false sharing
+/// between the producer and consumer. The head and tail indices are kept on separate
+/// cache lines to maximize performance.
+///
+/// # Layout
+///
+/// ```text
+/// ┌──────────────┐
+/// │ head         │  <- Consumer's read position (cache line aligned)
+/// ├──────────────┤
+/// │ padding      │
+/// ├──────────────┤
+/// │ tail         │  <- Producer's write position (cache line aligned)
+/// ├──────────────┤
+/// │ padding      │
+/// ├──────────────┤
+/// │ rc           │  <- Reference count
+/// │ capacity     │  <- Buffer capacity
+/// ├──────────────┤
+/// │ padding      │
+/// ├──────────────┤
+/// │ buffer[...]  │  <- Actual data storage
+/// └──────────────┘
+/// ```
 ///
 /// # Invariants
-/// - head is valid value, unlesss head == tail,
-/// - tail is invalid, where we add next value
+///
+/// - `head` points to the next valid value to read (unless `head == tail`)
+/// - `tail` points to the next position where a value should be written
+/// - When `head == tail`, the queue is empty
+/// - When `(tail + 1) % capacity == head`, the queue is full
+/// - The actual capacity is `capacity - 1` to distinguish empty from full
 #[cfg_attr(target_arch = "aarch64", repr(C, align(128)))]
 #[cfg_attr(target_arch = "x86_64", repr(C, align(64)))]
 pub(crate) struct Queue {
+    /// The read position (consumer side). Always on its own cache line to prevent false sharing.
     pub(crate) head: AtomicUsize,
+    /// Padding to ensure head is on its own cache line.
     _pad1: [u8; CACHE_LINE_SIZE - size_of::<AtomicUsize>()],
+    
+    /// The write position (producer side). Always on its own cache line to prevent false sharing.
     pub(crate) tail: AtomicUsize,
+    /// Padding to ensure tail is on its own cache line.
     _pad2: [u8; CACHE_LINE_SIZE - size_of::<AtomicUsize>()],
+    
+    /// Reference count for safe deallocation (2 when both sender and receiver exist).
     pub(crate) rc: AtomicUsize,
+    /// The total capacity of the buffer (actual usable capacity is capacity - 1).
     pub(crate) capacity: usize,
+    /// Padding to separate metadata from data.
     _pad3: [u8; CACHE_LINE_SIZE - size_of::<AtomicUsize>() - size_of::<usize>()],
+    
+    /// Zero-sized array that marks the start of the dynamically-sized buffer.
+    /// The actual buffer is allocated immediately after this structure.
     pub(crate) buffer: [BufferCell; 0],
 }
 
 impl Queue {
+    /// Creates a new queue with the specified capacity.
+    ///
+    /// The queue is heap-allocated with a single allocation that includes both
+    /// the header (head, tail, rc, capacity) and the buffer array.
+    ///
+    /// # Arguments
+    ///
+    /// * `capacity` - The requested capacity. The actual internal capacity will be
+    ///   `capacity + 1` to distinguish between empty and full states.
+    ///
+    /// # Returns
+    ///
+    /// A non-null pointer to the allocated queue structure.
+    ///
+    /// # Panics
+    ///
+    /// Panics if memory allocation fails.
     #[inline]
     pub(crate) fn with_capacity(capacity: usize) -> ptr::NonNull<Self> {
         let capacity = capacity + 1;
@@ -69,6 +137,17 @@ impl Queue {
         }
     }
 
+    /// Calculates the memory layout for a queue with the given capacity.
+    ///
+    /// This includes both the queue header and the buffer array.
+    ///
+    /// # Arguments
+    ///
+    /// * `capacity` - The buffer capacity (not the usable capacity).
+    ///
+    /// # Returns
+    ///
+    /// The memory layout required for the queue allocation.
     #[inline]
     pub(crate) fn layout(capacity: usize) -> Layout {
         let header = Layout::new::<Self>();
@@ -76,6 +155,21 @@ impl Queue {
         header.extend(array).unwrap().0.pad_to_align()
     }
 
+    /// Returns a pointer to the buffer element at the given index.
+    ///
+    /// # Safety
+    ///
+    /// - `ptr` must be a valid pointer to a Queue
+    /// - `idx` must be less than the queue's capacity
+    ///
+    /// # Arguments
+    ///
+    /// * `ptr` - Pointer to the queue
+    /// * `idx` - Index into the buffer
+    ///
+    /// # Returns
+    ///
+    /// A const pointer to the buffer cell at the given index.
     #[inline]
     pub(crate) unsafe fn elem(ptr: *mut Self, idx: usize) -> *const BufferCell {
         unsafe {
@@ -84,6 +178,23 @@ impl Queue {
         }
     }
 
+    /// Returns a mutable pointer to the buffer element at the given index (loom only).
+    ///
+    /// This variant is only used when testing with loom for concurrency checking.
+    ///
+    /// # Safety
+    ///
+    /// - `ptr` must be a valid pointer to a Queue
+    /// - `idx` must be less than the queue's capacity
+    ///
+    /// # Arguments
+    ///
+    /// * `ptr` - Pointer to the queue
+    /// * `idx` - Index into the buffer
+    ///
+    /// # Returns
+    ///
+    /// A mutable pointer to the buffer cell at the given index.
     #[cfg(loomer)]
     #[inline]
     pub(crate) unsafe fn elem_mut(ptr: *mut Self, idx: usize) -> *mut BufferCell {
@@ -93,7 +204,19 @@ impl Queue {
         }
     }
 
-    // SAFETY: we verify rc before calling free, so we have exclusive access for dealloc
+    /// Frees the queue and all remaining elements.
+    ///
+    /// This method drops all elements still in the queue and deallocates the memory.
+    ///
+    /// # Safety
+    ///
+    /// - Must only be called when the reference count has reached 0
+    /// - The caller must ensure exclusive access to the queue
+    /// - This is enforced by checking `rc` before calling `free`
+    ///
+    /// # Arguments
+    ///
+    /// * `ptr` - Non-null pointer to the queue to be freed
     pub(crate) unsafe fn free(mut ptr: ptr::NonNull<Self>) {
         let queue = unsafe { ptr.as_mut() };
         let capacity = queue.capacity;

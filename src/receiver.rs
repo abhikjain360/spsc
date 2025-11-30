@@ -1,3 +1,9 @@
+//! Consumer side of the SPSC channel.
+//!
+//! This module contains the `Receiver` type which allows receiving values from the queue.
+//! It supports both blocking and non-blocking operations, as well as async operations
+//! and batch receives.
+
 use std::{
     cmp, iter,
     pin::Pin,
@@ -9,12 +15,47 @@ use futures::Future;
 
 use crate::{Queue, QueueValue, sev, sync::*, wfe};
 
+/// The receiving half of the channel.
+///
+/// Values can be received from the queue using this type. The receiver is `Send` but not `Sync`,
+/// meaning it can be moved between threads but cannot be shared.
+///
+/// # Examples
+///
+/// Basic usage:
+///
+/// ```
+/// use gil::channel;
+///
+/// let (mut tx, mut rx) = channel(10);
+/// tx.send(42);
+/// assert_eq!(rx.recv(), 42);
+/// ```
+///
+/// Async usage:
+///
+/// ```
+/// use gil::channel;
+///
+/// # async fn example() {
+/// let (mut tx, mut rx) = channel(10);
+/// tx.send_async(42).await;
+/// assert_eq!(rx.recv_async().await, 42);
+/// # }
+/// ```
 pub struct Receiver {
     buffer: NonNull<Queue>,
     local_tail: usize,
 }
 
 impl Receiver {
+    /// Creates a new receiver from a queue pointer.
+    ///
+    /// This is an internal function used by the `channel` constructor.
+    ///
+    /// # Arguments
+    ///
+    /// * `buffer` - Non-null pointer to the shared queue
     pub(crate) fn new(buffer: NonNull<Queue>) -> Self {
         Self {
             buffer,
@@ -22,6 +63,26 @@ impl Receiver {
         }
     }
 
+    /// Attempts to receive a value from the queue without blocking.
+    ///
+    /// This method returns immediately, either returning a value if one is available
+    /// or `None` if the queue is empty.
+    ///
+    /// # Returns
+    ///
+    /// - `Some(value)` if a value was available
+    /// - `None` if the queue is empty
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gil::channel;
+    ///
+    /// let (mut tx, mut rx) = channel(10);
+    /// assert_eq!(rx.try_recv(), None); // Queue is empty
+    /// tx.send(42);
+    /// assert_eq!(rx.try_recv(), Some(42));
+    /// ```
     pub fn try_recv(&mut self) -> Option<QueueValue> {
         // SAFETY: we are the only ones accessing it apart from other end which will not remove the
         // buffer, so its safe to derefernce.
@@ -33,7 +94,7 @@ impl Receiver {
             self.local_tail = buffer.tail.load(Ordering::Acquire);
 
             // retry with updated head value
-            // hecking twice is still cheaper than reading atomically twice
+            // checking twice is still cheaper than reading atomically twice
             if cur_head == self.local_tail {
                 return None;
             }
@@ -61,6 +122,35 @@ impl Receiver {
         Some(val)
     }
 
+    /// Receives a value from the queue, blocking if the queue is empty.
+    ///
+    /// This method will wait until a value is available in the queue. It uses a two-phase
+    /// waiting strategy:
+    /// 1. Optimistic spinning for ~1000 iterations to catch immediate updates
+    /// 2. Power-saving wait (WFE on ARM) if the queue remains empty
+    ///
+    /// # Returns
+    ///
+    /// The received value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::thread;
+    /// use gil::channel;
+    ///
+    /// let (mut tx, mut rx) = channel(10);
+    ///
+    /// thread::spawn(move || {
+    ///     for i in 0..100 {
+    ///         tx.send(i);
+    ///     }
+    /// });
+    ///
+    /// for i in 0..100 {
+    ///     assert_eq!(rx.recv(), i);
+    /// }
+    /// ```
     pub fn recv(&mut self) -> QueueValue {
         // SAFETY: we are the only ones accessing it apart from other end which will not remove the
         // buffer, so its safe to derefernce.
@@ -74,7 +164,7 @@ impl Receiver {
             if cur_head == self.local_tail {
                 // PHASE 1: Optimistic Spin (Hot Potato)
                 // Spin for a short time to catch immediate updates.
-                // 100 iterations is usually enough to cover the cross-core latency (~40-80ns)
+                // 1000 iterations is usually enough to cover the cross-core latency (~40-80ns)
                 // without burning excessive CPU.
                 for _ in 0..1000 {
                     let new_val = buffer.tail.load(Ordering::Acquire);
@@ -86,7 +176,7 @@ impl Receiver {
                 }
 
                 // PHASE 2: Power-Saving Wait (WFE)
-                // If we waited 100 spins and nothing happened, the other thread
+                // If we waited 1000 spins and nothing happened, the other thread
                 // is likely busy or descheduled. Sleep until signalled.
                 while cur_head == self.local_tail {
                     let new_val = buffer.tail.load(Ordering::Acquire);
@@ -135,11 +225,62 @@ impl Receiver {
         val
     }
 
+    /// Receives a value asynchronously from the queue.
+    ///
+    /// Returns a future that resolves when a value is available. The future will
+    /// yield if the queue is empty and retry on the next poll.
+    ///
+    /// # Returns
+    ///
+    /// A future that completes with the received value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gil::channel;
+    ///
+    /// # async fn example() {
+    /// let (mut tx, mut rx) = channel(10);
+    ///
+    /// tx.send_async(42).await;
+    /// assert_eq!(rx.recv_async().await, 42);
+    /// # }
+    /// ```
     #[inline]
     pub fn recv_async(&mut self) -> RecvFut<'_> {
         RecvFut { receiver: self }
     }
 
+    /// Receives a value asynchronously from the queue into a buffer.
+    ///
+    /// Returns a future that receives up to `limit` values from the queue.
+    /// The future yields if the queue is empty.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - The buffer to extend with received values
+    /// * `limit` - Maximum number of values to receive
+    ///
+    /// # Returns
+    ///
+    /// A future that completes with the number of values received.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::collections::VecDeque;
+    /// use gil::channel;
+    ///
+    /// # async fn example() {
+    /// let (mut tx, mut rx) = channel(10);
+    /// tx.send(1);
+    /// tx.send(2);
+    ///
+    /// let mut buf = VecDeque::new();
+    /// let count = rx.batch_recv_async(&mut buf, 10).await;
+    /// assert_eq!(count, 2);
+    /// # }
+    /// ```
     #[inline]
     pub fn batch_recv_async<'a, I>(
         &'a mut self,
@@ -153,6 +294,37 @@ impl Receiver {
         }
     }
 
+    /// Receives multiple values from the queue into a buffer, up to a limit.
+    ///
+    /// This is more efficient than calling `try_recv` in a loop because it amortizes
+    /// the cost of atomic operations. It will receive as many values as are available,
+    /// up to the specified limit, and then return immediately without blocking.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - A collection that can be extended with received values
+    /// * `limit` - Maximum number of values to receive
+    ///
+    /// # Returns
+    ///
+    /// The number of values received (0 if queue was empty).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::collections::VecDeque;
+    /// use gil::channel;
+    ///
+    /// let (mut tx, mut rx) = channel(10);
+    /// tx.send(1);
+    /// tx.send(2);
+    /// tx.send(3);
+    ///
+    /// let mut buf = VecDeque::new();
+    /// let count = rx.batch_recv(&mut buf, 10);
+    /// assert_eq!(count, 3);
+    /// assert_eq!(buf, vec![1, 2, 3]);
+    /// ```
     pub fn batch_recv(&mut self, buf: &mut impl iter::Extend<QueueValue>, limit: usize) -> usize {
         // SAFETY: we are the only ones accessing it apart from other end which will not remove the
         // buffer, so its safe to derefernce.
@@ -165,8 +337,8 @@ impl Receiver {
             if cur_head == self.local_tail {
                 self.local_tail = buffer.tail.load(Ordering::Acquire);
 
-                // cretry with updated head value
-                // hecking twice is still cheaper than reading atomically twice
+                // retry with updated head value
+                // checking twice is still cheaper than reading atomically twice
                 if cur_head == self.local_tail {
                     break;
                 }
@@ -315,6 +487,9 @@ impl Drop for Receiver {
     }
 }
 
+/// Future returned by `recv_async()`.
+///
+/// This future will attempt to receive a value, yielding if the queue is empty.
 pub struct RecvFut<'receiver> {
     receiver: &'receiver mut Receiver,
 }
@@ -343,6 +518,9 @@ impl<'receiver> Future for RecvFut<'receiver> {
     }
 }
 
+/// Future returned by `batch_recv_async()`.
+///
+/// This future will receive multiple values, yielding if the queue is empty.
 pub struct BatchRecvFut<'a, I> {
     receiver: &'a mut Receiver,
     buf: &'a mut I,

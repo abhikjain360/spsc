@@ -1,58 +1,4 @@
-//! # gil - Get In Line
-//!
-//! A fast single-producer single-consumer (SPSC) queue with both sync and async support.
-//!
-//! This crate provides a lock-free, bounded queue optimized for scenarios where you have
-//! exactly one producer and one consumer. Both the producer and consumer can run on
-//! different threads and can be moved between threads, but they cannot be shared.
-//!
-//! ## Features
-//!
-//! - **Lock-free**: Uses atomic operations for synchronization
-//! - **High performance** (probably): Competitive with Facebook's folly implementation
-//! - **Flexible APIs**: Blocking, non-blocking, and async operations
-//! - **Batch operations**: Efficiently send/receive multiple items at once
-//!
-//! ## Example
-//!
-//! ```rust
-//! use std::thread;
-//! use gil::channel;
-//!
-//! let (mut tx, mut rx) = channel(100);
-//!
-//! thread::spawn(move || {
-//!     for i in 0..100 {
-//!         tx.send(i);
-//!     }
-//! });
-//!
-//! for i in 0..100 {
-//!     let value = rx.recv();
-//!     assert_eq!(value, i);
-//! }
-//! ```
-//!
-//! ## Async Example
-//!
-//! ```rust
-//! use gil::channel;
-//!
-//! # async fn example() {
-//! let (mut tx, mut rx) = channel(100);
-//!
-//! tokio::spawn(async move {
-//!     for i in 0..100 {
-//!         tx.send_async(i).await;
-//!     }
-//! });
-//!
-//! for i in 0..100 {
-//!     let value = rx.recv_async().await;
-//!     assert_eq!(value, i);
-//! }
-//! # }
-//! ```
+#![doc = include_str!("../README.md")]
 
 mod queue;
 mod receiver;
@@ -65,7 +11,11 @@ pub use sender::Sender;
 use sync::*;
 
 /// Wait For Event - puts the core into a low-power state until an event occurs.
-/// On non-aarch64, loom, or miri, this is a no-op.
+///
+/// On ARM64 architectures, this uses the `wfe` instruction for power-efficient waiting.
+/// On other architectures, or when testing with loom/miri, this is a no-op.
+///
+/// This is used internally by blocking operations when the queue is empty or full.
 #[inline(always)]
 pub(crate) fn wfe() {
     #[cfg(all(target_arch = "aarch64", not(loomer), not(miri)))]
@@ -75,7 +25,11 @@ pub(crate) fn wfe() {
 }
 
 /// Send Event - wakes up cores waiting in WFE state.
-/// On non-aarch64, loom, or miri, this is a no-op.
+///
+/// On ARM64 architectures, this uses the `sev` instruction to wake waiting cores.
+/// On other architectures, or when testing with loom/miri, this is a no-op.
+///
+/// This is used internally after writing to the queue to potentially wake the other side.
 #[inline(always)]
 pub(crate) fn sev() {
     #[cfg(all(target_arch = "aarch64", not(loomer), not(miri)))]
@@ -84,9 +38,11 @@ pub(crate) fn sev() {
     }
 }
 
+/// The value type stored in the queue on x86_64 architectures.
 #[cfg(target_arch = "x86_64")]
 pub type QueueValue = u64;
 
+/// The value type stored in the queue on aarch64 (ARM64) architectures.
 #[cfg(target_arch = "aarch64")]
 pub type QueueValue = u128;
 
@@ -111,6 +67,10 @@ pub type QueueValue = u128;
 /// tx.send(42);
 /// assert_eq!(rx.recv(), 42);
 /// ```
+///
+/// # Panics
+///
+/// Panics if memory allocation fails.
 #[inline]
 pub fn channel(capacity: usize) -> (Sender, Receiver) {
     let queue_ptr = Queue::with_capacity(capacity);
