@@ -79,7 +79,7 @@ impl Receiver {
     /// tx.send(42);
     /// assert_eq!(rx.try_recv(), Some(42));
     /// ```
-    pub fn try_recv(&mut self) -> Option<QueueValue> {
+    pub fn try_recv(&self) -> Option<QueueValue> {
         // SAFETY: we are the only ones accessing it apart from other end which will not remove the
         // buffer, so its safe to derefernce.
         let buffer = unsafe { self.buffer.as_ref() };
@@ -146,7 +146,7 @@ impl Receiver {
     ///     assert_eq!(rx.recv(), i);
     /// }
     /// ```
-    pub fn recv(&mut self) -> QueueValue {
+    pub fn recv(&self) -> QueueValue {
         // SAFETY: we are the only ones accessing it apart from other end which will not remove the
         // buffer, so its safe to derefernce.
         let buffer = unsafe { self.buffer.as_ref() };
@@ -220,7 +220,7 @@ impl Receiver {
     /// # }
     /// ```
     #[inline]
-    pub fn recv_async(&mut self) -> RecvFut<'_> {
+    pub fn recv_async(&self) -> RecvFut<'_> {
         RecvFut { receiver: self }
     }
 
@@ -255,11 +255,7 @@ impl Receiver {
     /// # }
     /// ```
     #[inline]
-    pub fn batch_recv_async<'a, I>(
-        &'a mut self,
-        buf: &'a mut I,
-        limit: usize,
-    ) -> BatchRecvFut<'a, I> {
+    pub fn batch_recv_async<'a, I>(&'a self, buf: &'a mut I, limit: usize) -> BatchRecvFut<'a, I> {
         BatchRecvFut {
             receiver: self,
             buf,
@@ -298,7 +294,7 @@ impl Receiver {
     /// assert_eq!(count, 3);
     /// assert_eq!(buf, vec![1, 2, 3]);
     /// ```
-    pub fn batch_recv(&mut self, buf: &mut impl iter::Extend<QueueValue>, limit: usize) -> usize {
+    pub fn batch_recv(&self, buf: &mut impl iter::Extend<QueueValue>, limit: usize) -> usize {
         let mut total_count = 0;
 
         while total_count < limit {
@@ -349,7 +345,7 @@ impl Receiver {
     /// rx.advance(len);
     /// ```
     #[inline(always)]
-    pub fn get_read_slice(&mut self) -> &[QueueValue] {
+    pub fn get_read_slice(&self) -> &[QueueValue] {
         let buffer = unsafe { self.buffer.as_ref() };
         let head = buffer.head.load(Ordering::Relaxed);
 
@@ -402,7 +398,7 @@ impl Receiver {
     /// rx.advance(count);
     /// ```
     #[inline(always)]
-    pub fn advance(&mut self, count: usize) {
+    pub fn advance(&self, count: usize) {
         if count == 0 {
             return;
         }
@@ -437,12 +433,12 @@ impl Drop for Receiver {
 ///
 /// This future will attempt to receive a value, yielding if the queue is empty.
 pub struct RecvFut<'receiver> {
-    receiver: &'receiver mut Receiver,
+    receiver: &'receiver Receiver,
 }
 
 impl<'receiver> RecvFut<'receiver> {
     #[inline]
-    fn project(self: Pin<&mut Self>) -> &mut Receiver {
+    fn project(self: Pin<&mut Self>) -> &Receiver {
         // SAFETY: we should NEVER move out any values
         let me = unsafe { self.get_unchecked_mut() };
         me.receiver
@@ -468,14 +464,14 @@ impl<'receiver> Future for RecvFut<'receiver> {
 ///
 /// This future will receive multiple values, yielding if the queue is empty.
 pub struct BatchRecvFut<'a, I> {
-    receiver: &'a mut Receiver,
+    receiver: &'a Receiver,
     buf: &'a mut I,
     limit: usize,
 }
 
 impl<'a, I> BatchRecvFut<'a, I> {
     #[inline]
-    fn project(self: Pin<&mut Self>) -> (&mut Receiver, &mut I, usize) {
+    fn project(self: Pin<&mut Self>) -> (&Receiver, &mut I, usize) {
         // SAFETY: we should NEVER move out any values
         let me = unsafe { self.get_unchecked_mut() };
         (me.receiver, me.buf, me.limit)
@@ -503,3 +499,4 @@ where
 
 // SAFETY: internal queue has atomic pointers to head and tails, and thus is safe to send
 unsafe impl Send for Receiver {}
+unsafe impl Sync for Receiver {}

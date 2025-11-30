@@ -78,12 +78,11 @@ impl Sender {
     /// ```
     /// use gil::channel;
     ///
-    /// let (mut tx, mut rx) = channel(2);
+    /// let (mut tx, mut rx) = channel(1);
     /// assert!(tx.try_send(1).is_ok());
-    /// assert!(tx.try_send(2).is_ok());
-    /// assert!(tx.try_send(3).is_err()); // Queue is full
+    /// assert!(tx.try_send(2).is_err()); // Queue is full
     /// ```
-    pub fn try_send(&mut self, val: QueueValue) -> Result<(), QueueValue> {
+    pub fn try_send(&self, val: QueueValue) -> Result<(), QueueValue> {
         // SAFETY: we are the only ones accessing it apart from other end which will not remove the
         // buffer, so its safe to derefernce.
         let buffer = unsafe { self.buffer.as_ref() };
@@ -147,7 +146,7 @@ impl Sender {
     ///     assert_eq!(rx.recv(), i);
     /// }
     /// ```
-    pub fn send(&mut self, val: QueueValue) {
+    pub fn send(&self, val: QueueValue) {
         // SAFETY: we are the only ones accessing it apart from other end which will not remove the
         // buffer, so its safe to derefernce.
         let buffer = unsafe { self.buffer.as_ref() };
@@ -221,7 +220,7 @@ impl Sender {
     /// # }
     /// ```
     #[inline]
-    pub fn send_async(&mut self, val: QueueValue) -> SendFut<'_> {
+    pub fn send_async(&self, val: QueueValue) -> SendFut<'_> {
         SendFut {
             sender: self,
             to_send: Some(val),
@@ -252,7 +251,7 @@ impl Sender {
     /// let sent = tx.batch_send(&mut values.into_iter());
     /// assert_eq!(sent, 5);
     /// ```
-    pub fn batch_send(&mut self, vals: &mut impl Iterator<Item = QueueValue>) -> usize {
+    pub fn batch_send(&self, vals: &mut impl Iterator<Item = QueueValue>) -> usize {
         let mut total_count = 0;
 
         loop {
@@ -317,7 +316,7 @@ impl Sender {
     ///     assert_eq!(rx.recv(), i);
     /// }
     /// ```
-    pub fn batch_send_all(&mut self, vals: impl Iterator<Item = QueueValue>) {
+    pub fn batch_send_all(&self, vals: impl Iterator<Item = QueueValue>) {
         // SAFETY: we are the only ones accessing it apart from other end which will not remove the
         // buffer, so its safe to derefernce.
         let buffer = unsafe { self.buffer.as_ref() };
@@ -394,7 +393,7 @@ impl Sender {
     /// ```
     #[inline]
     pub fn batch_send_all_async<I: Iterator<Item = QueueValue>>(
-        &mut self,
+        &self,
         vals: I,
     ) -> BatchSendAllFut<'_, I> {
         BatchSendAllFut {
@@ -431,7 +430,7 @@ impl Sender {
     ///     // Write data directly
     ///     unsafe {
     ///         ptr::copy_nonoverlapping(
-    ///             data.as_ptr() as *const std::mem::MaybeUninit<_>,
+    ///             data.as_ptr(),
     ///             slice.as_mut_ptr(),
     ///             count
     ///         );
@@ -439,13 +438,13 @@ impl Sender {
     /// }
     /// tx.commit(count);
     /// ```
-    #[inline(always)]
-    pub fn get_write_slice(&mut self) -> &mut [QueueValue] {
+    #[expect(clippy::mut_from_ref)]
+    pub fn get_write_slice(&self) -> &mut [QueueValue] {
         let buffer = unsafe { self.buffer.as_ref() };
         let tail = buffer.tail.load(Ordering::Relaxed);
 
         let mut local_head = buffer.local_head.get();
-        
+
         // Check if we need to refresh local_head
         let occupied = if tail >= local_head {
             tail - local_head
@@ -502,12 +501,12 @@ impl Sender {
     /// let slice = tx.get_write_slice();
     /// let count = slice.len().min(10);
     /// for i in 0..count {
-    ///     slice[i].write(i as u128);
+    ///     slice[i] = i as u128;
     /// }
     /// tx.commit(count);
     /// ```
     #[inline(always)]
-    pub fn commit(&mut self, count: usize) {
+    pub fn commit(&self, count: usize) {
         if count == 0 {
             return;
         }
@@ -542,13 +541,13 @@ impl Drop for Sender {
 ///
 /// This future will attempt to send a value, yielding if the queue is full.
 pub struct SendFut<'sender> {
-    sender: &'sender mut Sender,
+    sender: &'sender Sender,
     to_send: Option<QueueValue>,
 }
 
 impl<'sender> SendFut<'sender> {
     #[inline]
-    fn project(self: Pin<&mut Self>) -> (&mut Sender, &mut Option<QueueValue>) {
+    fn project(self: Pin<&mut Self>) -> (&Sender, &mut Option<QueueValue>) {
         // SAFETY: we should NEVER move out any values
         let me = unsafe { self.get_unchecked_mut() };
         (me.sender, &mut me.to_send)
@@ -575,13 +574,13 @@ impl<'sender> Future for SendFut<'sender> {
 ///
 /// This future will send all values from an iterator, yielding when the queue is full.
 pub struct BatchSendAllFut<'sender, I: Iterator<Item = QueueValue>> {
-    sender: &'sender mut Sender,
+    sender: &'sender Sender,
     iter: iter::Peekable<I>,
     total_count: usize,
 }
 
 impl<'sender, I: Iterator<Item = QueueValue>> BatchSendAllFut<'sender, I> {
-    fn project(self: Pin<&mut Self>) -> (&mut Sender, &mut iter::Peekable<I>, &mut usize) {
+    fn project(self: Pin<&mut Self>) -> (&Sender, &mut iter::Peekable<I>, &mut usize) {
         // SAFETY: we should NEVER move out any values
         let me = unsafe { self.get_unchecked_mut() };
         (me.sender, &mut me.iter, &mut me.total_count)
@@ -606,3 +605,4 @@ impl<'sender, I: Iterator<Item = QueueValue>> Future for BatchSendAllFut<'sender
 
 // SAFETY: internal queue has atomic pointers to head and tails, and thus is safe to send
 unsafe impl Send for Sender {}
+unsafe impl Sync for Sender {}

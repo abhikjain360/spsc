@@ -113,9 +113,10 @@ impl Queue {
     ///
     /// # Arguments
     ///
-    /// * `capacity` - The requested capacity. The actual internal capacity will be
-    ///   `capacity + 1` to distinguish between empty and full states.
-    ///   The internal capacity must be a power of 2 for efficient masking.
+    /// * `capacity` - The requested capacity. The actual capacity will be at least
+    ///   `capacity`, possibly more. Internally, the capacity is rounded up to the
+    ///   next power of 2 (after adding 1 to distinguish empty from full states)
+    ///   for efficient masking operations.
     ///
     /// # Returns
     ///
@@ -123,20 +124,13 @@ impl Queue {
     ///
     /// # Panics
     ///
-    /// Panics if memory allocation fails or if `capacity + 1` is not a power of 2.
+    /// Panics if memory allocation fails.
     #[inline]
     pub(crate) fn with_capacity(capacity: usize) -> ptr::NonNull<Self> {
         let internal_capacity = capacity + 1;
 
-        // Runtime check: internal capacity (capacity + 1) must be a power of 2
-        assert!(
-            internal_capacity.is_power_of_two(),
-            "Queue internal capacity (capacity + 1) must be a power of 2. Requested capacity: {}, internal capacity: {}. Please use a capacity that is one less than a power of 2 (e.g., 1, 3, 7, 15, 31, 63, 127, 255, 511, 1023, ...).",
-            capacity,
-            internal_capacity
-        );
-
-        let capacity = internal_capacity;
+        // Round up to next power of 2 for efficient masking
+        let capacity = internal_capacity.next_power_of_two();
         let mask = capacity - 1;
         let layout = Self::layout(capacity);
 

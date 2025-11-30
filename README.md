@@ -155,7 +155,7 @@ let count = data.len().min(slice.len());
 
 unsafe {
     ptr::copy_nonoverlapping(
-        data.as_ptr() as *const std::mem::MaybeUninit<u128>,
+        data.as_ptr(),
         slice.as_mut_ptr(),
         count
     );
@@ -163,11 +163,14 @@ unsafe {
 tx.commit(count);
 
 // Zero-copy read
-let slice = rx.get_read_slice();
-for &value in slice {
-    println!("Value: {}", value);
-}
-rx.advance(slice.len());
+let len = {
+    let slice = rx.get_read_slice();
+    for &value in slice {
+        println!("Value: {}", value);
+    }
+    slice.len()
+};
+rx.advance(len);
 ```
 
 ## Performance

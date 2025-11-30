@@ -4,7 +4,7 @@ use std::hint::black_box;
 use tokio::runtime::Runtime;
 
 async fn run_channel(capacity: usize, counts: QueueValue) {
-    let (mut tx, mut rx) = channel(capacity);
+    let (tx, rx) = channel(capacity);
 
     tokio::spawn(async move {
         for i in 0..counts {
@@ -18,11 +18,11 @@ async fn run_channel(capacity: usize, counts: QueueValue) {
 }
 
 async fn run_channel_batch(capacity: usize, counts: QueueValue) {
-    let (mut tx, mut rx) = channel(capacity);
+    let (tx, rx) = channel(capacity);
     const BATCH_SIZE: usize = 128;
 
     tokio::spawn(async move {
-        let iter = (0..counts).map(|i| black_box(i));
+        let iter = (0..counts).map(black_box);
         tx.batch_send_all_async(iter).await;
     });
 

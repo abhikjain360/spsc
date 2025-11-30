@@ -11,8 +11,8 @@ fn latency_bench(c: &mut Criterion) {
     for capacity in [64, 512, 1024, 4096, 65536] {
         group.bench_function(format!("capacity_{}", capacity), |b| {
             b.iter_custom(|iters| {
-                let (mut tx1, mut rx1) = channel(capacity);
-                let (mut tx2, mut rx2) = channel(capacity);
+                let (tx1, rx1) = channel(capacity);
+                let (tx2, rx2) = channel(capacity);
 
                 let t = thread::spawn(move || {
                     for _ in 0..iters {

@@ -4,7 +4,7 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use gil::{QueueValue, channel};
 
 fn run_channel(capacity: usize, counts: QueueValue) {
-    let (mut tx, mut rx) = channel(capacity);
+    let (tx, rx) = channel(capacity);
 
     thread::spawn(move || {
         for i in 0..counts {
@@ -18,10 +18,10 @@ fn run_channel(capacity: usize, counts: QueueValue) {
 }
 
 fn run_channel_batch(capacity: usize, counts: QueueValue, batch_size: usize) {
-    let (mut tx, mut rx) = channel(capacity);
+    let (tx, rx) = channel(capacity);
 
     thread::spawn(move || {
-        let iter = (0..counts).map(|i| black_box(i));
+        let iter = (0..counts).map(black_box);
         tx.batch_send_all(iter);
     });
 
@@ -35,7 +35,7 @@ fn run_channel_batch(capacity: usize, counts: QueueValue, batch_size: usize) {
 }
 
 fn run_channel_zerocopy(capacity: usize, counts: QueueValue, batch_size: usize) {
-    let (mut tx, mut rx) = channel(capacity);
+    let (tx, rx) = channel(capacity);
 
     thread::spawn(move || {
         let mut remaining = counts;

@@ -3,11 +3,11 @@ use std::ptr;
 use std::thread;
 use std::time::Instant;
 
-const CAPACITY: usize = (1 << 12) - 1;
+const CAPACITY: usize = 1 << 12;
 const ITERATIONS: usize = 100_000_000;
 
 fn run() {
-    let (mut tx, mut rx) = channel(CAPACITY);
+    let (tx, rx) = channel(CAPACITY);
 
     let start = Instant::now();
 
@@ -32,7 +32,7 @@ fn run() {
         (ITERATIONS as f64 / elapsed.as_secs_f64()) / 1_000_000.0
     );
 
-    let (mut tx, mut rx) = channel(CAPACITY);
+    let (tx, rx) = channel(CAPACITY);
 
     let start = Instant::now();
 
@@ -46,8 +46,8 @@ fn run() {
                 continue;
             }
 
-            let batch = remaining.min(slice.len() as usize);
-            let batch = batch.min(128 as usize) as usize;
+            let batch = remaining.min(slice.len());
+            let batch = batch.min(128);
 
             unsafe {
                 ptr::copy_nonoverlapping(dummy_data.as_ptr(), slice.as_mut_ptr(), batch);
