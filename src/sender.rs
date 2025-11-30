@@ -220,7 +220,7 @@ impl Sender {
     /// # }
     /// ```
     #[inline]
-    pub fn send_async(&self, val: QueueValue) -> SendFut<'_> {
+    pub fn send_async(&mut self, val: QueueValue) -> SendFut<'_> {
         SendFut {
             sender: self,
             to_send: Some(val),
@@ -393,7 +393,7 @@ impl Sender {
     /// ```
     #[inline]
     pub fn batch_send_all_async<I: Iterator<Item = QueueValue>>(
-        &self,
+        &mut self,
         vals: I,
     ) -> BatchSendAllFut<'_, I> {
         BatchSendAllFut {
@@ -541,16 +541,16 @@ impl Drop for Sender {
 ///
 /// This future will attempt to send a value, yielding if the queue is full.
 pub struct SendFut<'sender> {
-    sender: &'sender Sender,
+    sender: &'sender mut Sender,
     to_send: Option<QueueValue>,
 }
 
 impl<'sender> SendFut<'sender> {
     #[inline]
-    fn project(self: Pin<&mut Self>) -> (&Sender, &mut Option<QueueValue>) {
+    fn project(self: Pin<&mut Self>) -> (&mut Sender, &mut Option<QueueValue>) {
         // SAFETY: we should NEVER move out any values
         let me = unsafe { self.get_unchecked_mut() };
-        (me.sender, &mut me.to_send)
+        (&mut *me.sender, &mut me.to_send)
     }
 }
 
@@ -574,16 +574,16 @@ impl<'sender> Future for SendFut<'sender> {
 ///
 /// This future will send all values from an iterator, yielding when the queue is full.
 pub struct BatchSendAllFut<'sender, I: Iterator<Item = QueueValue>> {
-    sender: &'sender Sender,
+    sender: &'sender mut Sender,
     iter: iter::Peekable<I>,
     total_count: usize,
 }
 
 impl<'sender, I: Iterator<Item = QueueValue>> BatchSendAllFut<'sender, I> {
-    fn project(self: Pin<&mut Self>) -> (&Sender, &mut iter::Peekable<I>, &mut usize) {
+    fn project(self: Pin<&mut Self>) -> (&mut Sender, &mut iter::Peekable<I>, &mut usize) {
         // SAFETY: we should NEVER move out any values
         let me = unsafe { self.get_unchecked_mut() };
-        (me.sender, &mut me.iter, &mut me.total_count)
+        (&mut *me.sender, &mut me.iter, &mut me.total_count)
     }
 }
 
@@ -603,6 +603,8 @@ impl<'sender, I: Iterator<Item = QueueValue>> Future for BatchSendAllFut<'sender
     }
 }
 
-// SAFETY: internal queue has atomic pointers to head and tails, and thus is safe to send
+// SAFETY: The Sender owns a NonNull<Queue> which points to a heap allocation that outlives
+// the Sender. The queue uses atomic operations for cross-thread synchronization.
+// Sender is Send (can be moved between threads) but NOT Sync (cannot be shared via &Sender)
+// because methods use Cell for local caching which is not thread-safe.
 unsafe impl Send for Sender {}
-unsafe impl Sync for Sender {}

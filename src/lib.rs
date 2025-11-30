@@ -131,7 +131,7 @@ mod test {
         futures::executor::block_on(async {
             const COUNTS: usize = 4096;
 
-            let (tx, rx) = channel(COUNTS);
+            let (mut tx, mut rx) = channel(COUNTS);
 
             thread::spawn(move || {
                 for i in 0..COUNTS << 1 {
@@ -191,7 +191,7 @@ mod test {
     fn test_async_batch_send() {
         futures::executor::block_on(async {
             const COUNTS: usize = 256;
-            let (tx, rx) = channel(COUNTS);
+            let (mut tx, rx) = channel(COUNTS);
 
             thread::spawn(move || {
                 let v: Vec<QueueValue> = (0..200).map(|i| i as QueueValue).collect();
@@ -212,7 +212,7 @@ mod test {
     fn test_async_batch_recv() {
         futures::executor::block_on(async {
             const COUNTS: usize = 256;
-            let (tx, rx) = channel(COUNTS);
+            let (tx, mut rx) = channel(COUNTS);
 
             thread::spawn(move || {
                 for i in 0..(COUNTS << 8) + (COUNTS >> 1) + 1 {

@@ -31,8 +31,8 @@ use gil::{QueueValue, channel};
 // ============================================================================
 
 fn latency_gil(capacity: usize, iters: u64) {
-    let (mut tx1, mut rx1) = channel(capacity);
-    let (mut tx2, mut rx2) = channel(capacity);
+    let (tx1, rx1) = channel(capacity);
+    let (tx2, rx2) = channel(capacity);
 
     let t = thread::spawn(move || {
         for _ in 0..iters {
@@ -157,7 +157,7 @@ fn latency_bench(c: &mut Criterion) {
 // ============================================================================
 
 fn throughput_gil_simple(capacity: usize, counts: QueueValue) {
-    let (mut tx, mut rx) = channel(capacity);
+    let (tx, rx) = channel(capacity);
 
     thread::spawn(move || {
         for i in 0..counts {
@@ -218,10 +218,10 @@ fn throughput_flume_simple(capacity: usize, counts: u64) {
 // ============================================================================
 
 fn throughput_gil_batch(capacity: usize, counts: QueueValue, batch_size: usize) {
-    let (mut tx, mut rx) = channel(capacity);
+    let (tx, rx) = channel(capacity);
 
     thread::spawn(move || {
-        let iter = (0..counts).map(|i| black_box(i));
+        let iter = (0..counts).map(black_box);
         tx.batch_send_all(iter);
     });
 
@@ -337,7 +337,7 @@ fn throughput_flume_batch(capacity: usize, counts: u64, batch_size: usize) {
 // ============================================================================
 
 fn throughput_gil_zerocopy(capacity: usize, counts: QueueValue, batch_size: usize) {
-    let (mut tx, mut rx) = channel(capacity);
+    let (tx, rx) = channel(capacity);
 
     thread::spawn(move || {
         let mut remaining = counts;

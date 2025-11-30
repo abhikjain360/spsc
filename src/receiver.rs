@@ -220,7 +220,7 @@ impl Receiver {
     /// # }
     /// ```
     #[inline]
-    pub fn recv_async(&self) -> RecvFut<'_> {
+    pub fn recv_async(&mut self) -> RecvFut<'_> {
         RecvFut { receiver: self }
     }
 
@@ -255,7 +255,11 @@ impl Receiver {
     /// # }
     /// ```
     #[inline]
-    pub fn batch_recv_async<'a, I>(&'a self, buf: &'a mut I, limit: usize) -> BatchRecvFut<'a, I> {
+    pub fn batch_recv_async<'a, I>(
+        &'a mut self,
+        buf: &'a mut I,
+        limit: usize,
+    ) -> BatchRecvFut<'a, I> {
         BatchRecvFut {
             receiver: self,
             buf,
@@ -433,15 +437,15 @@ impl Drop for Receiver {
 ///
 /// This future will attempt to receive a value, yielding if the queue is empty.
 pub struct RecvFut<'receiver> {
-    receiver: &'receiver Receiver,
+    receiver: &'receiver mut Receiver,
 }
 
 impl<'receiver> RecvFut<'receiver> {
     #[inline]
-    fn project(self: Pin<&mut Self>) -> &Receiver {
+    fn project(self: Pin<&mut Self>) -> &mut Receiver {
         // SAFETY: we should NEVER move out any values
         let me = unsafe { self.get_unchecked_mut() };
-        me.receiver
+        &mut *me.receiver
     }
 }
 
@@ -464,17 +468,17 @@ impl<'receiver> Future for RecvFut<'receiver> {
 ///
 /// This future will receive multiple values, yielding if the queue is empty.
 pub struct BatchRecvFut<'a, I> {
-    receiver: &'a Receiver,
+    receiver: &'a mut Receiver,
     buf: &'a mut I,
     limit: usize,
 }
 
 impl<'a, I> BatchRecvFut<'a, I> {
     #[inline]
-    fn project(self: Pin<&mut Self>) -> (&Receiver, &mut I, usize) {
+    fn project(self: Pin<&mut Self>) -> (&mut Receiver, &mut I, usize) {
         // SAFETY: we should NEVER move out any values
         let me = unsafe { self.get_unchecked_mut() };
-        (me.receiver, me.buf, me.limit)
+        (&mut *me.receiver, me.buf, me.limit)
     }
 }
 
@@ -497,6 +501,8 @@ where
     }
 }
 
-// SAFETY: internal queue has atomic pointers to head and tails, and thus is safe to send
+// SAFETY: The Receiver owns a NonNull<Queue> which points to a heap allocation that outlives
+// the Receiver. The queue uses atomic operations for cross-thread synchronization.
+// Receiver is Send (can be moved between threads) but NOT Sync (cannot be shared via &Receiver)
+// because methods use Cell for local caching which is not thread-safe.
 unsafe impl Send for Receiver {}
-unsafe impl Sync for Receiver {}

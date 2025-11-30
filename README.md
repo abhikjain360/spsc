@@ -37,54 +37,48 @@ Consumer blocks until there is a value on the queue, or use `Receiver::try_recv`
 use std::thread;
 use gil::channel;
 
-fn main() {
-    const COUNT: u128 = 100_000;
+const COUNT: u128 = 100_000;
 
-    let (mut tx, mut rx) = channel(COUNT as usize);
+let (mut tx, mut rx) = channel(COUNT as usize);
 
-    let handle = thread::spawn(move || {
-        for i in 0..COUNT {
-            // Block until send completes
-            tx.send(i);
-        }
-    });
-
+let handle = thread::spawn(move || {
     for i in 0..COUNT {
-        // Block until recv completes
-        let value = rx.recv();
-        assert_eq!(value, i);
+        // Block until send completes
+        tx.send(i);
     }
+});
 
-    handle.join().unwrap();
+for i in 0..COUNT {
+    // Block until recv completes
+    let value = rx.recv();
+    assert_eq!(value, i);
 }
+
+handle.join().unwrap();
 ```
 
 ### Async Example
 
 ```rust
 use gil::channel;
+const COUNT: u128 = 100_000;
 
-#[tokio::main]
-async fn main() {
-    const COUNT: u128 = 100_000;
+let (mut tx, mut rx) = channel(COUNT as usize);
 
-    let (mut tx, mut rx) = channel(COUNT as usize);
-
-    let handle = tokio::spawn(async move {
-        for i in 0..COUNT {
-            // Await until send completes
-            tx.send_async(i).await;
-        }
-    });
-
+let handle = tokio::spawn(async move {
     for i in 0..COUNT {
-        // Await until recv completes
-        let value = rx.recv_async().await;
-        assert_eq!(value, i);
+        // Await until send completes
+        tx.send_async(i).await;
     }
+});
 
-    handle.await.unwrap();
+for i in 0..COUNT {
+    // Await until recv completes
+    let value = rx.recv_async().await;
+    assert_eq!(value, i);
 }
+
+handle.await.unwrap();
 ```
 
 ### Non-blocking Operations

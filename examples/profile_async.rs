@@ -6,7 +6,7 @@ async fn main() {
     const CAPACITY: usize = 1 << 12;
     const ITERATIONS: usize = 50_000_000;
 
-    let (tx, rx) = channel(CAPACITY);
+    let (mut tx, mut rx) = channel(CAPACITY);
 
     let start = Instant::now();
 
