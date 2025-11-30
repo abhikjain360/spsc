@@ -2,7 +2,7 @@
 //
 // This benchmark compares:
 // - gil (this library)
-// - bounded-spsc-queue (SPSC only, requires nightly)
+// - bounded-spsc-queue (SPSC only, requires nightly - feature flag)
 // - crossbeam-channel (MPMC)
 // - flume (MPMC)
 //
@@ -16,7 +16,7 @@
 //    - Zero-copy: Direct memory access (gil only)
 //
 // Note: bounded-spsc-queue requires nightly Rust due to allocator_api feature
-// Run with: `cargo +nightly bench --bench comparison`
+// Run with: `cargo +nightly bench --bench comparison --features bounded-spsc-queue`
 
 use std::hint::black_box;
 use std::ptr;
@@ -31,8 +31,8 @@ use gil::{QueueValue, channel};
 // ============================================================================
 
 fn latency_gil(capacity: usize, iters: u64) {
-    let (mut tx1, mut rx1) = channel(capacity);
-    let (mut tx2, mut rx2) = channel(capacity);
+    let (mut tx1, mut rx1) = channel(capacity - 1);
+    let (mut tx2, mut rx2) = channel(capacity - 1);
 
     let t = thread::spawn(move || {
         for _ in 0..iters {
@@ -50,6 +50,7 @@ fn latency_gil(capacity: usize, iters: u64) {
     t.join().unwrap();
 }
 
+#[cfg(feature = "bounded-spsc-queue")]
 fn latency_bounded_spsc_queue(capacity: usize, iters: u64) {
     let (p1, c1) = bounded_spsc_queue::make(capacity);
     let (p2, c2) = bounded_spsc_queue::make(capacity);
@@ -122,6 +123,7 @@ fn latency_bench(c: &mut Criterion) {
             })
         });
 
+        #[cfg(feature = "bounded-spsc-queue")]
         group.bench_function(format!("bounded_spsc_queue_{}", capacity), |b| {
             b.iter_custom(|iters| {
                 let start = Instant::now();
@@ -155,19 +157,20 @@ fn latency_bench(c: &mut Criterion) {
 // ============================================================================
 
 fn throughput_gil_simple(capacity: usize, counts: QueueValue) {
-    let (mut tx, mut rx) = channel(capacity);
+    let (mut tx, mut rx) = channel(capacity - 1);
 
     thread::spawn(move || {
         for i in 0..counts {
-            tx.send2(black_box(i));
+            tx.send(black_box(i));
         }
     });
 
     for _ in 0..counts {
-        black_box(rx.recv2());
+        black_box(rx.recv());
     }
 }
 
+#[cfg(feature = "bounded-spsc-queue")]
 fn throughput_bounded_spsc_queue_simple(capacity: usize, counts: u64) {
     let (p, c) = bounded_spsc_queue::make(capacity);
 
@@ -215,7 +218,7 @@ fn throughput_flume_simple(capacity: usize, counts: u64) {
 // ============================================================================
 
 fn throughput_gil_batch(capacity: usize, counts: QueueValue, batch_size: usize) {
-    let (mut tx, mut rx) = channel(capacity);
+    let (mut tx, mut rx) = channel(capacity - 1);
 
     thread::spawn(move || {
         let iter = (0..counts).map(|i| black_box(i));
@@ -334,7 +337,7 @@ fn throughput_flume_batch(capacity: usize, counts: u64, batch_size: usize) {
 // ============================================================================
 
 fn throughput_gil_zerocopy(capacity: usize, counts: QueueValue, batch_size: usize) {
-    let (mut tx, mut rx) = channel(capacity);
+    let (mut tx, mut rx) = channel(capacity - 1);
 
     thread::spawn(move || {
         let mut remaining = counts;
@@ -395,6 +398,7 @@ fn throughput_bench(c: &mut Criterion) {
             b.iter(|| throughput_gil_simple(capacity, COUNTS))
         });
 
+        #[cfg(feature = "bounded-spsc-queue")]
         group.bench_function(format!("bounded_spsc_queue_simple_{}", capacity), |b| {
             b.iter(|| throughput_bounded_spsc_queue_simple(capacity, COUNTS as u64))
         });

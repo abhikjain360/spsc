@@ -45,7 +45,6 @@ use crate::{Queue, QueueValue, sev, sync::*};
 /// ```
 pub struct Receiver {
     buffer: NonNull<Queue>,
-    local_tail: usize,
 }
 
 impl Receiver {
@@ -57,10 +56,7 @@ impl Receiver {
     ///
     /// * `buffer` - Non-null pointer to the shared queue
     pub(crate) fn new(buffer: NonNull<Queue>) -> Self {
-        Self {
-            buffer,
-            local_tail: 0,
-        }
+        Self { buffer }
     }
 
     /// Attempts to receive a value from the queue without blocking.
@@ -90,12 +86,14 @@ impl Receiver {
 
         let cur_head = buffer.head.load(Ordering::Relaxed);
 
-        if cur_head == self.local_tail {
-            self.local_tail = buffer.tail.load(Ordering::Acquire);
+        let local_tail = buffer.local_tail.get();
+        if cur_head == local_tail {
+            let new_local_tail = buffer.tail.load(Ordering::Acquire);
+            buffer.local_tail.set(new_local_tail);
 
             // retry with updated head value
             // checking twice is still cheaper than reading atomically twice
-            if cur_head == self.local_tail {
+            if cur_head == new_local_tail {
                 return None;
             }
         }
@@ -111,10 +109,7 @@ impl Receiver {
                 .with(|ptr| (ptr as *const QueueValue).read())
         };
 
-        let mut new_head = cur_head + 1;
-        if new_head == buffer.capacity {
-            new_head = 0;
-        }
+        let new_head = (cur_head + 1) & buffer.mask_consumer;
 
         // this is fine as we are the only ones writing to head
         buffer.head.store(new_head, Ordering::Release);
@@ -158,20 +153,20 @@ impl Receiver {
 
         let cur_head = buffer.head.load(Ordering::Relaxed);
 
-        let mut new_head = cur_head + 1;
-        if new_head == buffer.capacity {
-            new_head = 0;
-        }
+        let new_head = (cur_head + 1) & buffer.mask_consumer;
 
-        if cur_head == self.local_tail {
-            self.local_tail = buffer.tail.load(Ordering::Acquire);
+        let mut local_tail = buffer.local_tail.get();
+        if cur_head == local_tail {
+            local_tail = buffer.tail.load(Ordering::Acquire);
+            buffer.local_tail.set(local_tail);
 
-            if cur_head == self.local_tail {
+            if cur_head == local_tail {
                 let mut spin_count = 0_u8;
-                while cur_head == self.local_tail {
+                while cur_head == local_tail {
                     let new_val = buffer.tail.load(Ordering::Acquire);
-                    if new_val != self.local_tail {
-                        self.local_tail = new_val;
+                    if new_val != local_tail {
+                        local_tail = new_val;
+                        buffer.local_tail.set(local_tail);
                         break;
                     }
 
@@ -358,18 +353,20 @@ impl Receiver {
         let buffer = unsafe { self.buffer.as_ref() };
         let head = buffer.head.load(Ordering::Relaxed);
 
-        if head == self.local_tail {
-            self.local_tail = buffer.tail.load(Ordering::Acquire);
-            if head == self.local_tail {
+        let mut local_tail = buffer.local_tail.get();
+        if head == local_tail {
+            local_tail = buffer.tail.load(Ordering::Acquire);
+            buffer.local_tail.set(local_tail);
+            if head == local_tail {
                 return &[]; // Empty
             }
         }
 
         // Calculate available data
-        let available_total = if self.local_tail >= head {
-            self.local_tail - head
+        let available_total = if local_tail >= head {
+            local_tail - head
         } else {
-            buffer.capacity - (head - self.local_tail)
+            buffer.capacity - (head - local_tail)
         };
 
         let contiguous_data = buffer.capacity - head;
@@ -412,10 +409,7 @@ impl Receiver {
 
         let buffer = unsafe { self.buffer.as_ref() };
         let head = buffer.head.load(Ordering::Relaxed);
-        let mut new_head = head + count;
-        if new_head >= buffer.capacity {
-            new_head -= buffer.capacity;
-        }
+        let new_head = (head + count) & buffer.mask_consumer;
 
         buffer.head.store(new_head, Ordering::Release);
         sev()

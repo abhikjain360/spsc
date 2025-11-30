@@ -3,7 +3,7 @@ use std::time::Instant;
 
 #[tokio::main]
 async fn main() {
-    const CAPACITY: usize = 1024;
+    const CAPACITY: usize = 1 << 12 - 1;
     const ITERATIONS: usize = 50_000_000;
 
     let (mut tx, mut rx) = channel(CAPACITY);

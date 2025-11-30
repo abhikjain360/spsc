@@ -45,7 +45,6 @@ use crate::{Queue, QueueValue, sev, sync::*, wfe};
 /// ```
 pub struct Sender {
     buffer: NonNull<Queue>,
-    local_head: usize,
 }
 
 impl Sender {
@@ -57,10 +56,7 @@ impl Sender {
     ///
     /// * `buffer` - Non-null pointer to the shared queue
     pub(crate) fn new(buffer: NonNull<Queue>) -> Self {
-        Self {
-            buffer,
-            local_head: 0,
-        }
+        Self { buffer }
     }
 
     /// Attempts to send a value into the queue without blocking.
@@ -93,15 +89,14 @@ impl Sender {
         let buffer = unsafe { self.buffer.as_ref() };
 
         let cur_tail = buffer.tail.load(Ordering::Relaxed);
-        let mut new_tail = cur_tail + 1;
-        if new_tail == buffer.capacity {
-            new_tail = 0;
-        }
+        let new_tail = (cur_tail + 1) & buffer.mask_producer;
 
-        if self.local_head == new_tail {
-            self.local_head = buffer.head.load(Ordering::Acquire);
+        let local_head = buffer.local_head.get();
+        if local_head == new_tail {
+            let new_local_head = buffer.head.load(Ordering::Acquire);
+            buffer.local_head.set(new_local_head);
 
-            if self.local_head == new_tail {
+            if new_local_head == new_tail {
                 return Err(val);
             }
         }
@@ -158,20 +153,20 @@ impl Sender {
         let buffer = unsafe { self.buffer.as_ref() };
 
         let cur_tail = buffer.tail.load(Ordering::Relaxed);
-        let mut new_tail = cur_tail + 1;
-        if new_tail == buffer.capacity {
-            new_tail = 0;
-        }
+        let new_tail = (cur_tail + 1) & buffer.mask_producer;
 
-        if self.local_head == new_tail {
-            self.local_head = buffer.head.load(Ordering::Acquire);
+        let mut local_head = buffer.local_head.get();
+        if local_head == new_tail {
+            local_head = buffer.head.load(Ordering::Acquire);
+            buffer.local_head.set(local_head);
 
-            if self.local_head == new_tail {
+            if local_head == new_tail {
                 let mut spin_count = 0_u8;
-                while self.local_head == new_tail {
+                while local_head == new_tail {
                     let new_val = buffer.head.load(Ordering::Acquire);
-                    if new_val != self.local_head {
-                        self.local_head = new_val;
+                    if new_val != local_head {
+                        local_head = new_val;
+                        buffer.local_head.set(local_head);
                         break;
                     }
 
@@ -328,22 +323,22 @@ impl Sender {
         let buffer = unsafe { self.buffer.as_ref() };
 
         let mut cur_tail = buffer.tail.load(Ordering::Relaxed);
-        let mut new_tail = cur_tail + 1;
-        if new_tail == buffer.capacity {
-            new_tail = 0;
-        }
+        let mut new_tail = (cur_tail + 1) & buffer.mask_producer;
 
         for val in vals {
-            if self.local_head == new_tail {
+            let mut local_head = buffer.local_head.get();
+            if local_head == new_tail {
                 buffer.tail.store(cur_tail, Ordering::Release);
 
-                self.local_head = buffer.head.load(Ordering::Acquire);
+                local_head = buffer.head.load(Ordering::Acquire);
+                buffer.local_head.set(local_head);
 
-                if self.local_head == new_tail {
-                    while self.local_head == new_tail {
+                if local_head == new_tail {
+                    while local_head == new_tail {
                         let new_val = buffer.head.load(Ordering::Acquire);
-                        if new_val != self.local_head {
-                            self.local_head = new_val;
+                        if new_val != local_head {
+                            local_head = new_val;
+                            buffer.local_head.set(local_head);
                             break;
                         }
                         wfe();
@@ -364,10 +359,7 @@ impl Sender {
             }
 
             cur_tail = new_tail;
-            new_tail += 1;
-            if new_tail == buffer.capacity {
-                new_tail = 0;
-            }
+            new_tail = (new_tail + 1) & buffer.mask_producer;
         }
 
         buffer.tail.store(cur_tail, Ordering::Release);
@@ -452,21 +444,24 @@ impl Sender {
         let buffer = unsafe { self.buffer.as_ref() };
         let tail = buffer.tail.load(Ordering::Relaxed);
 
+        let mut local_head = buffer.local_head.get();
+        
         // Check if we need to refresh local_head
-        let occupied = if tail >= self.local_head {
-            tail - self.local_head
+        let occupied = if tail >= local_head {
+            tail - local_head
         } else {
-            buffer.capacity - (self.local_head - tail)
+            buffer.capacity - (local_head - tail)
         };
 
         if occupied >= buffer.capacity - 1 {
             // Refresh head to see if consumer moved
-            self.local_head = buffer.head.load(Ordering::Acquire);
+            local_head = buffer.head.load(Ordering::Acquire);
+            buffer.local_head.set(local_head);
 
-            let occupied = if tail >= self.local_head {
-                tail - self.local_head
+            let occupied = if tail >= local_head {
+                tail - local_head
             } else {
-                buffer.capacity - (self.local_head - tail)
+                buffer.capacity - (local_head - tail)
             };
 
             if occupied >= buffer.capacity - 1 {
@@ -519,10 +514,7 @@ impl Sender {
 
         let buffer = unsafe { self.buffer.as_ref() };
         let tail = buffer.tail.load(Ordering::Relaxed);
-        let mut new_tail = tail + count;
-        if new_tail >= buffer.capacity {
-            new_tail -= buffer.capacity;
-        }
+        let new_tail = (tail + count) & buffer.mask_producer;
 
         buffer.tail.store(new_tail, Ordering::Release);
         sev();

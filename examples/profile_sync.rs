@@ -3,7 +3,7 @@ use std::ptr;
 use std::thread;
 use std::time::Instant;
 
-const CAPACITY: usize = 1 << 12; // Power of 2
+const CAPACITY: usize = (1 << 12) - 1;
 const ITERATIONS: usize = 100_000_000;
 
 fn run() {

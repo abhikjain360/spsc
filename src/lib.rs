@@ -57,20 +57,23 @@ pub type QueueValue = u128;
 ///
 /// * `capacity` - The maximum number of items that can be stored in the queue at once.
 ///   This capacity is fixed and cannot be changed after creation.
+///   **Note:** The capacity must be one less than a power of 2 (e.g., 1, 3, 7, 15, 31, 63, 127, 255, 511, 1023, ...)
+///   to enable efficient masking operations. This is because internally the queue uses `capacity + 1` slots,
+///   which must be a power of 2.
 ///
 /// # Examples
 ///
 /// ```
 /// use gil::channel;
 ///
-/// let (mut tx, mut rx) = channel(10);
+/// let (mut tx, mut rx) = channel(15); // 15 + 1 = 16, which is 2^4
 /// tx.send(42);
 /// assert_eq!(rx.recv(), 42);
 /// ```
 ///
 /// # Panics
 ///
-/// Panics if memory allocation fails.
+/// Panics if memory allocation fails or if `capacity + 1` is not a power of 2.
 #[inline]
 pub fn channel(capacity: usize) -> (Sender, Receiver) {
     let queue_ptr = Queue::with_capacity(capacity);

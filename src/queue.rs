@@ -4,7 +4,7 @@
 //! both the synchronous and asynchronous channel operations.
 
 #[cfg(not(loomer))]
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::{
     alloc::{Layout, alloc, dealloc, handle_alloc_error},
     mem::{MaybeUninit, size_of},
@@ -12,7 +12,7 @@ use std::{
 };
 
 #[cfg(loomer)]
-use loom::cell::UnsafeCell;
+use loom::cell::{Cell, UnsafeCell};
 
 use crate::{QueueValue, sync::*};
 
@@ -71,21 +71,35 @@ const CACHE_LINE_SIZE: usize = 128;
 pub(crate) struct Queue {
     /// The read position (consumer side). Always on its own cache line to prevent false sharing.
     pub(crate) head: AtomicUsize,
+    /// Consumer's cached tail value for reducing atomic loads.
+    pub(crate) local_tail: Cell<usize>,
+    /// Capacity mask (capacity - 1) for fast modulo via bitwise AND.
+    pub(crate) mask_consumer: usize,
     /// Padding to ensure head is on its own cache line.
-    _pad1: [u8; CACHE_LINE_SIZE - size_of::<AtomicUsize>()],
-    
+    _pad1: [u8; CACHE_LINE_SIZE
+        - size_of::<AtomicUsize>()
+        - size_of::<Cell<usize>>()
+        - size_of::<usize>()],
+
     /// The write position (producer side). Always on its own cache line to prevent false sharing.
     pub(crate) tail: AtomicUsize,
+    /// Producer's cached head value for reducing atomic loads.
+    pub(crate) local_head: Cell<usize>,
+    /// Capacity mask (capacity - 1) for fast modulo via bitwise AND.
+    pub(crate) mask_producer: usize,
     /// Padding to ensure tail is on its own cache line.
-    _pad2: [u8; CACHE_LINE_SIZE - size_of::<AtomicUsize>()],
-    
+    _pad2: [u8; CACHE_LINE_SIZE
+        - size_of::<AtomicUsize>()
+        - size_of::<Cell<usize>>()
+        - size_of::<usize>()],
+
     /// Reference count for safe deallocation (2 when both sender and receiver exist).
     pub(crate) rc: AtomicUsize,
     /// The total capacity of the buffer (actual usable capacity is capacity - 1).
     pub(crate) capacity: usize,
     /// Padding to separate metadata from data.
     _pad3: [u8; CACHE_LINE_SIZE - size_of::<AtomicUsize>() - size_of::<usize>()],
-    
+
     /// Zero-sized array that marks the start of the dynamically-sized buffer.
     /// The actual buffer is allocated immediately after this structure.
     pub(crate) buffer: [BufferCell; 0],
@@ -101,6 +115,7 @@ impl Queue {
     ///
     /// * `capacity` - The requested capacity. The actual internal capacity will be
     ///   `capacity + 1` to distinguish between empty and full states.
+    ///   The internal capacity must be a power of 2 for efficient masking.
     ///
     /// # Returns
     ///
@@ -108,10 +123,21 @@ impl Queue {
     ///
     /// # Panics
     ///
-    /// Panics if memory allocation fails.
+    /// Panics if memory allocation fails or if `capacity + 1` is not a power of 2.
     #[inline]
     pub(crate) fn with_capacity(capacity: usize) -> ptr::NonNull<Self> {
-        let capacity = capacity + 1;
+        let internal_capacity = capacity + 1;
+
+        // Runtime check: internal capacity (capacity + 1) must be a power of 2
+        assert!(
+            internal_capacity.is_power_of_two(),
+            "Queue internal capacity (capacity + 1) must be a power of 2. Requested capacity: {}, internal capacity: {}. Please use a capacity that is one less than a power of 2 (e.g., 1, 3, 7, 15, 31, 63, 127, 255, 511, 1023, ...).",
+            capacity,
+            internal_capacity
+        );
+
+        let capacity = internal_capacity;
+        let mask = capacity - 1;
         let layout = Self::layout(capacity);
 
         unsafe {
@@ -121,7 +147,11 @@ impl Queue {
             }
 
             ptr::addr_of_mut!((*ptr).head).write(AtomicUsize::new(0));
+            ptr::addr_of_mut!((*ptr).local_tail).write(Cell::new(0));
+            ptr::addr_of_mut!((*ptr).mask_consumer).write(mask);
             ptr::addr_of_mut!((*ptr).tail).write(AtomicUsize::new(0));
+            ptr::addr_of_mut!((*ptr).local_head).write(Cell::new(0));
+            ptr::addr_of_mut!((*ptr).mask_producer).write(mask);
             ptr::addr_of_mut!((*ptr).rc).write(AtomicUsize::new(0));
             ptr::addr_of_mut!((*ptr).capacity).write(capacity);
 
@@ -220,6 +250,7 @@ impl Queue {
     pub(crate) unsafe fn free(mut ptr: ptr::NonNull<Self>) {
         let queue = unsafe { ptr.as_mut() };
         let capacity = queue.capacity;
+        let mask = queue.mask_consumer;
         let layout = Self::layout(capacity);
 
         let mut head = queue.head.load(Ordering::SeqCst);
@@ -240,10 +271,7 @@ impl Queue {
                         .as_mut_ptr(),
                 );
             }
-            head += 1;
-            if head == capacity {
-                head = 0;
-            }
+            head = (head + 1) & mask;
         }
 
         #[cfg(loomer)]
