@@ -42,9 +42,6 @@ impl Sender {
             }
         }
 
-        // CONDITIONAL SIGNALING: Check if buffer was empty BEFORE this write
-        let was_empty = cur_tail == self.local_head;
-
         #[cfg(not(loomer))]
         unsafe {
             ((*Queue::elem(self.buffer.as_ptr(), cur_tail)).get() as *mut QueueValue).write(val);
@@ -58,11 +55,6 @@ impl Sender {
 
         // store is fine as we are the only ones writing to tail
         buffer.tail.store(new_tail, Ordering::Release);
-
-        // Only wake consumer if buffer was previously empty (consumer might be sleeping)
-        if was_empty {
-            sev();
-        }
 
         Ok(())
     }
@@ -151,29 +143,15 @@ impl Sender {
             new_tail = 0;
         }
 
-        // Track if buffer was empty at the start
-        let was_empty_at_start = cur_tail == self.local_head;
-
         loop {
             if self.local_head == new_tail {
-                // PHASE 1: Optimistic Spin (Hot Potato)
-                for _ in 0..100 {
-                    let new_val = buffer.head.load(Ordering::Acquire);
-                    if new_val != self.local_head {
-                        self.local_head = new_val;
-                        break;
-                    }
-                    hint::spin_loop();
-                }
-
-                // PHASE 2: Power-Saving Wait (WFE)
                 if self.local_head == new_tail {
-                    wfe();
                     buffer.tail.store(cur_tail, Ordering::Release);
+                    wfe();
 
                     self.local_head = buffer.head.load(Ordering::Acquire);
                     if self.local_head == new_tail {
-                        return count;
+                        break;
                     }
                 }
             }
@@ -206,10 +184,7 @@ impl Sender {
 
         buffer.tail.store(cur_tail, Ordering::Release);
 
-        // Only wake consumer if buffer was empty when we started
-        if was_empty_at_start {
-            sev();
-        }
+        sev();
 
         count
     }
@@ -225,9 +200,6 @@ impl Sender {
             new_tail = 0;
         }
 
-        // Track if buffer was empty at the start
-        let was_empty_at_start = cur_tail == self.local_head;
-
         for val in vals {
             if self.local_head == new_tail {
                 buffer.tail.store(cur_tail, Ordering::Release);
@@ -235,17 +207,6 @@ impl Sender {
                 self.local_head = buffer.head.load(Ordering::Acquire);
 
                 if self.local_head == new_tail {
-                    // PHASE 1: Optimistic Spin (Hot Potato)
-                    for _ in 0..100 {
-                        let new_val = buffer.head.load(Ordering::Acquire);
-                        if new_val != self.local_head {
-                            self.local_head = new_val;
-                            break;
-                        }
-                        hint::spin_loop();
-                    }
-
-                    // PHASE 2: Power-Saving Wait (WFE)
                     while self.local_head == new_tail {
                         let new_val = buffer.head.load(Ordering::Acquire);
                         if new_val != self.local_head {
@@ -278,10 +239,7 @@ impl Sender {
 
         buffer.tail.store(cur_tail, Ordering::Release);
 
-        // Only wake consumer if buffer was empty when we started
-        if was_empty_at_start {
-            sev();
-        }
+        sev();
     }
 
     #[inline]

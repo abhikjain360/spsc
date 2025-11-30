@@ -55,22 +55,8 @@ impl Receiver {
             new_head = 0;
         }
 
-        // CONDITIONAL SIGNALING: Check if buffer was full BEFORE this read
-        // Calculate occupied slots before the read
-        let occupied = if self.local_tail >= cur_head {
-            self.local_tail - cur_head
-        } else {
-            buffer.capacity - (cur_head - self.local_tail)
-        };
-        let was_full = occupied >= buffer.capacity - 1;
-
         // this is fine as we are the only ones writing to head
         buffer.head.store(new_head, Ordering::Release);
-
-        // Only wake producer if buffer was previously full (producer might be sleeping)
-        if was_full {
-            sev();
-        }
 
         Some(val)
     }
@@ -175,14 +161,6 @@ impl Receiver {
 
         let mut cur_head = buffer.head.load(Ordering::Relaxed);
 
-        // Track if buffer was full at the start
-        let occupied_at_start = if self.local_tail >= cur_head {
-            self.local_tail - cur_head
-        } else {
-            buffer.capacity - (cur_head - self.local_tail)
-        };
-        let was_full_at_start = occupied_at_start >= buffer.capacity - 1;
-
         while count < limit {
             if cur_head == self.local_tail {
                 self.local_tail = buffer.tail.load(Ordering::Acquire);
@@ -217,10 +195,7 @@ impl Receiver {
 
         buffer.head.store(cur_head, Ordering::Release);
 
-        // Only wake producer if buffer was full when we started
-        if was_full_at_start {
-            sev();
-        }
+        sev();
 
         count
     }
