@@ -296,50 +296,24 @@ impl Receiver {
     /// assert_eq!(buf, vec![1, 2, 3]);
     /// ```
     pub fn batch_recv(&mut self, buf: &mut impl iter::Extend<QueueValue>, limit: usize) -> usize {
-        // SAFETY: we are the only ones accessing it apart from other end which will not remove the
-        // buffer, so its safe to derefernce.
-        let buffer = unsafe { self.buffer.as_ref() };
-        let mut count = 0;
+        let mut total_count = 0;
 
-        let mut cur_head = buffer.head.load(Ordering::Relaxed);
-
-        while count < limit {
-            if cur_head == self.local_tail {
-                self.local_tail = buffer.tail.load(Ordering::Acquire);
-
-                // retry with updated head value
-                // checking twice is still cheaper than reading atomically twice
-                if cur_head == self.local_tail {
-                    break;
-                }
+        while total_count < limit {
+            let slice = self.get_read_slice();
+            if slice.is_empty() {
+                break;
             }
 
-            #[cfg(not(loomer))]
-            let val = unsafe {
-                ((*Queue::elem(self.buffer.as_ptr(), cur_head)).get() as *const QueueValue).read()
-            };
-
-            #[cfg(loomer)]
-            let val = unsafe {
-                (*Queue::elem(self.buffer.as_ptr(), cur_head))
-                    .with(|ptr| (ptr as *const QueueValue).read())
-            };
+            let to_recv = cmp::min(slice.len(), limit - total_count);
 
             // TODO: change this to extend_one when it stabilizes
-            buf.extend(iter::once(val));
-            count += 1;
+            buf.extend(slice[..to_recv].iter().copied());
 
-            cur_head += 1;
-            if cur_head == buffer.capacity {
-                cur_head = 0;
-            }
+            self.advance(to_recv);
+            total_count += to_recv;
         }
 
-        buffer.head.store(cur_head, Ordering::Release);
-
-        sev();
-
-        count
+        total_count
     }
 
     /// Returns a slice of available data to read for zero-copy reads.

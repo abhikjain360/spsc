@@ -6,7 +6,6 @@
 
 use std::{
     cmp, iter,
-    mem::MaybeUninit,
     pin::Pin,
     ptr::NonNull,
     task::{Context, Poll},
@@ -251,61 +250,41 @@ impl Sender {
     /// assert_eq!(sent, 5);
     /// ```
     pub fn batch_send(&mut self, vals: &mut impl Iterator<Item = QueueValue>) -> usize {
-        // SAFETY: we are the only ones accessing it apart from other end which will not remove the
-        // buffer, so its safe to derefernce.
-        let buffer = unsafe { self.buffer.as_ref() };
-        let mut count = 0;
-
-        let mut cur_tail = buffer.tail.load(Ordering::Relaxed);
-        let mut new_tail = cur_tail + 1;
-        if new_tail == buffer.capacity {
-            new_tail = 0;
-        }
+        let mut total_count = 0;
 
         loop {
-            if self.local_head == new_tail {
-                if self.local_head == new_tail {
-                    buffer.tail.store(cur_tail, Ordering::Release);
-                    wfe();
+            let count = {
+                let slice = self.get_write_slice();
+                if slice.is_empty() {
+                    return total_count;
+                }
 
-                    self.local_head = buffer.head.load(Ordering::Acquire);
-                    if self.local_head == new_tail {
-                        break;
+                let mut count = 0;
+                for slot in slice.iter_mut() {
+                    match vals.next() {
+                        Some(val) => {
+                            // Write directly to the uninitialized memory
+                            unsafe {
+                                (slot as *mut QueueValue).write(val);
+                            }
+                            count += 1;
+                        }
+                        None => break,
                     }
                 }
+
+                count
+            }; // slice is dropped here
+
+            if count == 0 {
+                break;
             }
 
-            let val = match vals.next() {
-                Some(v) => v,
-                None => break,
-            };
-
-            #[cfg(not(loomer))]
-            unsafe {
-                ((*Queue::elem(self.buffer.as_ptr(), cur_tail)).get() as *mut QueueValue)
-                    .write(val);
-            }
-
-            #[cfg(loomer)]
-            unsafe {
-                (*Queue::elem(self.buffer.as_ptr(), cur_tail))
-                    .with_mut(|ptr| (ptr as *mut QueueValue).write(val));
-            }
-
-            count += 1;
-
-            cur_tail = new_tail;
-            new_tail += 1;
-            if new_tail == buffer.capacity {
-                new_tail = 0;
-            }
+            self.commit(count);
+            total_count += count;
         }
 
-        buffer.tail.store(cur_tail, Ordering::Release);
-
-        sev();
-
-        count
+        total_count
     }
 
     /// Sends all values from an iterator, blocking until all are sent.
@@ -461,7 +440,7 @@ impl Sender {
     /// tx.commit(count);
     /// ```
     #[inline(always)]
-    pub fn get_write_slice(&mut self) -> &mut [MaybeUninit<QueueValue>] {
+    pub fn get_write_slice(&mut self) -> &mut [QueueValue] {
         let buffer = unsafe { self.buffer.as_ref() };
         let tail = buffer.tail.load(Ordering::Relaxed);
 
@@ -495,8 +474,8 @@ impl Sender {
         let len = cmp::min(contiguous_space, available_total);
 
         unsafe {
-            let ptr = Queue::elem(self.buffer.as_ptr(), tail) as *mut MaybeUninit<QueueValue>;
-            std::slice::from_raw_parts_mut(ptr as *mut MaybeUninit<QueueValue>, len)
+            let ptr = Queue::elem(self.buffer.as_ptr(), tail) as *mut QueueValue;
+            std::slice::from_raw_parts_mut(ptr, len)
         }
     }
 
@@ -538,7 +517,6 @@ impl Sender {
         }
 
         buffer.tail.store(new_tail, Ordering::Release);
-
         sev();
     }
 }

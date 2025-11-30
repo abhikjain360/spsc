@@ -1,4 +1,4 @@
-use std::{hint::black_box, mem::MaybeUninit, ptr, thread};
+use std::{hint::black_box, ptr, thread};
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use gil::{QueueValue, channel};
@@ -56,11 +56,7 @@ fn run_channel_zerocopy(capacity: usize, counts: QueueValue, batch_size: usize) 
 
             // MEMCPY! This is what gets you high GB/s
             unsafe {
-                ptr::copy_nonoverlapping(
-                    dummy_data.as_ptr() as *const MaybeUninit<QueueValue>,
-                    slice.as_mut_ptr(),
-                    batch,
-                );
+                ptr::copy_nonoverlapping(dummy_data.as_ptr(), slice.as_mut_ptr(), batch);
             }
 
             tx.commit(batch);

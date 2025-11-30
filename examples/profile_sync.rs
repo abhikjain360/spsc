@@ -1,10 +1,9 @@
 use gil::{QueueValue, channel};
-use std::mem::MaybeUninit;
 use std::ptr;
 use std::thread;
 use std::time::Instant;
 
-const CAPACITY: usize = 65_536; // Power of 2
+const CAPACITY: usize = 1 << 16; // Power of 2
 const ITERATIONS: usize = 100_000_000;
 
 fn run() {
@@ -44,7 +43,10 @@ fn run() {
         while remaining > 0 {
             let slice = tx.get_write_slice();
             if slice.is_empty() {
-                std::thread::yield_now();
+                #[cfg(target_arch = "aarch64")]
+                unsafe {
+                    core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
+                }
                 continue;
             }
 
@@ -52,11 +54,7 @@ fn run() {
             let batch = batch.min(128 as usize) as usize;
 
             unsafe {
-                ptr::copy_nonoverlapping(
-                    dummy_data.as_ptr() as *const MaybeUninit<QueueValue>,
-                    slice.as_mut_ptr(),
-                    batch,
-                );
+                ptr::copy_nonoverlapping(dummy_data.as_ptr(), slice.as_mut_ptr(), batch);
             }
 
             tx.commit(batch);
@@ -69,7 +67,10 @@ fn run() {
         let len = {
             let slice = rx.get_read_slice();
             if slice.is_empty() {
-                std::thread::yield_now();
+                #[cfg(target_arch = "aarch64")]
+                unsafe {
+                    core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
+                }
                 continue;
             }
 
