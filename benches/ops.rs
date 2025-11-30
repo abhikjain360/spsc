@@ -90,14 +90,12 @@ fn run_channel_zerocopy(capacity: usize, counts: QueueValue, batch_size: usize) 
     }
 }
 
-pub fn throughput_bench(c: &mut Criterion) {
+pub fn ops_bench(c: &mut Criterion) {
     const COUNTS: QueueValue = 1_000_000;
     const BATCH_SIZE: usize = 128;
 
-    let mut group = c.benchmark_group("throughput");
-    group.throughput(Throughput::Bytes(
-        COUNTS as u64 * size_of::<QueueValue>() as u64,
-    ));
+    let mut group = c.benchmark_group("ops");
+    group.throughput(Throughput::Elements(COUNTS as u64));
     group.sample_size(50); // Reduce sample size to keep total time down while increasing per-iter work
     group.measurement_time(std::time::Duration::from_secs(10));
 
@@ -115,5 +113,5 @@ pub fn throughput_bench(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, throughput_bench);
+criterion_group!(benches, ops_bench);
 criterion_main!(benches);

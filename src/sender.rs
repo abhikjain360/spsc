@@ -168,35 +168,16 @@ impl Sender {
             self.local_head = buffer.head.load(Ordering::Acquire);
 
             if self.local_head == new_tail {
-                // PHASE 1: Optimistic Spin (Hot Potato)
-                // Spin for a short time to catch immediate updates.
-                // 1000 iterations is usually enough to cover the cross-core latency (~40-80ns)
-                // without burning excessive CPU.
-                for _ in 0..1000 {
-                    let new_val = buffer.head.load(Ordering::Acquire);
-                    if new_val != self.local_head {
-                        self.local_head = new_val;
-                        break;
-                    }
-                    hint::spin_loop();
-                }
-
-                // PHASE 2: Power-Saving Wait (WFE)
-                // If we waited 1000 spins and nothing happened, the other thread
-                // is likely busy or descheduled. Sleep until signalled.
                 while self.local_head == new_tail {
                     let new_val = buffer.head.load(Ordering::Acquire);
                     if new_val != self.local_head {
                         self.local_head = new_val;
                         break;
                     }
-                    wfe();
+                    std::thread::yield_now();
                 }
             }
         }
-
-        // CONDITIONAL SIGNALING: Check if buffer was empty BEFORE this write
-        let was_empty = cur_tail == self.local_head;
 
         #[cfg(not(loomer))]
         unsafe {
@@ -210,11 +191,6 @@ impl Sender {
         }
 
         buffer.tail.store(new_tail, Ordering::Release);
-
-        // Only wake consumer if buffer was previously empty (consumer might be sleeping)
-        if was_empty {
-            sev();
-        }
     }
 
     /// Sends a value asynchronously into the queue.

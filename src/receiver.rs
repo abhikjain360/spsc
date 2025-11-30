@@ -13,7 +13,7 @@ use std::{
 
 use futures::Future;
 
-use crate::{Queue, QueueValue, sev, sync::*, wfe};
+use crate::{Queue, QueueValue, sev, sync::*};
 
 /// The receiving half of the channel.
 ///
@@ -162,29 +162,13 @@ impl Receiver {
             self.local_tail = buffer.tail.load(Ordering::Acquire);
 
             if cur_head == self.local_tail {
-                // PHASE 1: Optimistic Spin (Hot Potato)
-                // Spin for a short time to catch immediate updates.
-                // 1000 iterations is usually enough to cover the cross-core latency (~40-80ns)
-                // without burning excessive CPU.
-                for _ in 0..1000 {
-                    let new_val = buffer.tail.load(Ordering::Acquire);
-                    if new_val != self.local_tail {
-                        self.local_tail = new_val;
-                        break;
-                    }
-                    hint::spin_loop();
-                }
-
-                // PHASE 2: Power-Saving Wait (WFE)
-                // If we waited 1000 spins and nothing happened, the other thread
-                // is likely busy or descheduled. Sleep until signalled.
                 while cur_head == self.local_tail {
                     let new_val = buffer.tail.load(Ordering::Acquire);
                     if new_val != self.local_tail {
                         self.local_tail = new_val;
                         break;
                     }
-                    wfe();
+                    std::thread::yield_now();
                 }
             }
         }
@@ -205,22 +189,8 @@ impl Receiver {
             new_head = 0;
         }
 
-        // CONDITIONAL SIGNALING: Check if buffer was full BEFORE this read
-        // Calculate occupied slots before the read
-        let occupied = if self.local_tail >= cur_head {
-            self.local_tail - cur_head
-        } else {
-            buffer.capacity - (cur_head - self.local_tail)
-        };
-        let was_full = occupied >= buffer.capacity - 1;
-
         // this is fine as we are the only ones writing to head
         buffer.head.store(new_head, Ordering::Release);
-
-        // Only wake producer if buffer was previously full (producer might be sleeping)
-        if was_full {
-            sev();
-        }
 
         val
     }

@@ -1,11 +1,13 @@
 use gil::{QueueValue, channel};
+use std::mem::MaybeUninit;
+use std::ptr;
 use std::thread;
 use std::time::Instant;
 
-fn main() {
-    const CAPACITY: usize = 1024; // Power of 2
-    const ITERATIONS: usize = 100_000_000;
+const CAPACITY: usize = 65_536; // Power of 2
+const ITERATIONS: usize = 100_000_000;
 
+fn run() {
     let (mut tx, mut rx) = channel(CAPACITY);
 
     let start = Instant::now();
@@ -16,16 +18,12 @@ fn main() {
         }
     });
 
-    let c = thread::spawn(move || {
-        let mut sum: QueueValue = 0;
-        for _ in 0..ITERATIONS {
-            sum = sum.wrapping_add(rx.recv());
-        }
-        sum
-    });
+    let mut sum: QueueValue = 0;
+    for _ in 0..ITERATIONS {
+        sum = sum.wrapping_add(rx.recv());
+    }
 
     p.join().unwrap();
-    let sum = c.join().unwrap();
 
     let elapsed = start.elapsed();
     println!(
@@ -34,4 +32,65 @@ fn main() {
         elapsed,
         (ITERATIONS as f64 / elapsed.as_secs_f64()) / 1_000_000.0
     );
+
+    let (mut tx, mut rx) = channel(CAPACITY);
+
+    let start = Instant::now();
+
+    let p = thread::spawn(move || {
+        let mut remaining = ITERATIONS;
+        let dummy_data = [123u128; 128];
+
+        while remaining > 0 {
+            let slice = tx.get_write_slice();
+            if slice.is_empty() {
+                std::thread::yield_now();
+                continue;
+            }
+
+            let batch = remaining.min(slice.len() as usize);
+            let batch = batch.min(128 as usize) as usize;
+
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    dummy_data.as_ptr() as *const MaybeUninit<QueueValue>,
+                    slice.as_mut_ptr(),
+                    batch,
+                );
+            }
+
+            tx.commit(batch);
+            remaining -= batch;
+        }
+    });
+
+    let mut received = 0;
+    while received < ITERATIONS {
+        let len = {
+            let slice = rx.get_read_slice();
+            if slice.is_empty() {
+                std::thread::yield_now();
+                continue;
+            }
+
+            slice.len()
+        };
+
+        rx.advance(len);
+        received += len;
+    }
+
+    p.join().unwrap();
+
+    let elapsed = start.elapsed();
+    println!(
+        "Zero-copy: Sum={}, Time={:?}, Ops/sec={:.2} M",
+        sum,
+        elapsed,
+        (ITERATIONS as f64 / elapsed.as_secs_f64()) / 1_000_000.0
+    );
+}
+
+fn main() {
+    run();
 }

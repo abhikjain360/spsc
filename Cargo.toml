@@ -37,25 +37,34 @@ name = "throughput_async"
 harness = false
 
 [[bench]]
+name = "ops"
+harness = false
+
+[[bench]]
+name = "ops_async"
+harness = false
+
+[[bench]]
 name = "latency"
 harness = false
 
 [profile.release]
 opt-level = 3
-debug = true
+debug = false
+strip = false
 debug-assertions = false
 overflow-checks = false
-lto = 'fat'
+lto = false
 panic = 'abort'
 incremental = false
-codegen-units = 16
+codegen-units = 1
 rpath = false
 
 [profile.bench]
 # Enable debug symbols for benchmarks, but keep optimizations
-debug = true
+debug = false
 opt-level = 3
 lto = 'fat'
 incremental = false
-codegen-units = 16
+codegen-units = 1
 rpath = false
