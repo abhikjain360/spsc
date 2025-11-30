@@ -17,7 +17,10 @@ exclude = [".lazy.lua"]
 futures = "0.3.31"
 
 [dev-dependencies]
+bounded-spsc-queue = "0.4.0"
 criterion = { version = "0.8.0", features = ["async_tokio", "html_reports"] }
+crossbeam-channel = "0.5.15"
+flume = "0.11.1"
 tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
 
 # using 'loomer' in cfg because otherwise conflicts with tokio's internal use of 'loom' and fails
@@ -38,6 +41,10 @@ harness = false
 
 [[bench]]
 name = "latency"
+harness = false
+
+[[bench]]
+name = "comparison"
 harness = false
 
 [profile.release]
