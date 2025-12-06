@@ -143,7 +143,7 @@ fn benchmark(c: &mut Criterion) {
                     }
 
                     unsafe {
-                        ptr::copy_nonoverlapping(src_data.as_ptr(), buf.as_mut_ptr(), len);
+                        ptr::copy_nonoverlapping(src_data.as_ptr().cast(), buf.as_mut_ptr(), len);
                     }
 
                     unsafe { tx.commit(len) };

@@ -102,7 +102,7 @@ mod test {
                 let buffer = tx.write_buffer();
                 let batch_size = buffer.len().min(TOTAL_ITEMS - sent);
                 for i in 0..batch_size {
-                    buffer[i] = sent + i;
+                    buffer[i].write(sent + i);
                 }
                 unsafe { tx.commit(batch_size) };
                 sent += batch_size;

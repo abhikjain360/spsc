@@ -1,8 +1,6 @@
-use crate::{
-    atomic::Ordering,
-    hint,
-    queue::QueuePtr,
-};
+use std::mem::MaybeUninit;
+
+use crate::{atomic::Ordering, hint, queue::QueuePtr};
 
 /// The producer end of the queue.
 ///
@@ -115,7 +113,13 @@ impl Sender {
     ///
     /// A mutable slice representing the contiguous free space starting from the current tail.
     /// Note that this might not represent *all* free space if the buffer wraps around.
-    pub fn write_buffer(&mut self) -> &mut [usize] {
+    ///
+    /// # Usage
+    ///
+    /// It returns a slice of [`MaybeUninit`](std::mem::MaybeUninit) to prevent UB, you can use
+    /// [`copy_nonoverlapping`](std::ptr::copy_nonoverlapping) if you want fast copying between
+    /// this and your own data.
+    pub fn write_buffer(&mut self) -> &mut [MaybeUninit<usize>] {
         let start = self.load_tail();
         let next = (start + 1) & self.mask;
 
@@ -132,7 +136,7 @@ impl Sender {
         };
 
         unsafe {
-            let ptr = self.ptr.at(start);
+            let ptr = self.ptr.at(start).cast();
             std::slice::from_raw_parts_mut(ptr.as_ptr(), end - start)
         }
     }
