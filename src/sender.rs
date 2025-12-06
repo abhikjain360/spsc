@@ -4,6 +4,10 @@ use crate::{
     queue::QueuePtr,
 };
 
+/// The producer end of the queue.
+///
+/// This struct is `Send` but not `Sync`. It can be moved to another thread, but cannot be shared
+/// across threads.
 pub struct Sender {
     ptr: QueuePtr,
     local_head: usize,
@@ -19,6 +23,12 @@ impl Sender {
         }
     }
 
+    /// Attempts to send a value into the queue without blocking.
+    ///
+    /// # Returns
+    ///
+    /// * `true` if the value was successfully sent.
+    /// * `false` if the queue is full.
     pub fn try_send(&mut self, value: usize) -> bool {
         let current_tail = self.load_tail();
         let new_tail = (current_tail + 1) & self.mask;
@@ -36,6 +46,10 @@ impl Sender {
         true
     }
 
+    /// Sends a value into the queue, blocking if necessary.
+    ///
+    /// This method uses a spin loop to wait for available space in the queue.
+    /// For a non-blocking alternative, use [`Sender::try_send`].
     pub fn send(&mut self, value: usize) {
         let current_tail = self.load_tail();
         let new_tail = (current_tail + 1) & self.mask;
@@ -49,6 +63,9 @@ impl Sender {
         self.store_tail(new_tail);
     }
 
+    /// Sends a value into the queue asynchronously.
+    ///
+    /// This method yields the current task if the queue is full.
     #[cfg(feature = "async")]
     pub async fn send_async(&mut self, value: usize) {
         use std::task::Poll;
@@ -86,6 +103,18 @@ impl Sender {
         .await
     }
 
+    /// Returns a mutable slice to the available write buffer in the queue.
+    ///
+    /// This allows writing multiple items directly into the queue's memory (zero-copy),
+    /// bypassing the per-item overhead of `send`.
+    ///
+    /// After writing to the buffer, you must call [`Sender::commit`] to make the items visible
+    /// to the receiver.
+    ///
+    /// # Returns
+    ///
+    /// A mutable slice representing the contiguous free space starting from the current tail.
+    /// Note that this might not represent *all* free space if the buffer wraps around.
     pub fn write_buffer(&mut self) -> &mut [usize] {
         let start = self.load_tail();
         let next = (start + 1) & self.mask;
@@ -108,9 +137,13 @@ impl Sender {
         }
     }
 
+    /// Commits items written to the buffer obtained via [`Sender::write_buffer`].
+    ///
     /// # Safety
-    /// - should be called only after getting a write slice from `write_buffer`
-    /// - `len` should be less than or equal to the length of slice given by `write_buffer`.
+    ///
+    /// * This function must only be called after writing data to the slice returned by [`Sender::write_buffer`].
+    /// * `len` must be less than or equal to the length of the slice returned by the most recent call to [`Sender::write_buffer`].
+    /// * Committing more items than available in the buffer slice will result in undefined behavior.
     #[inline(always)]
     pub unsafe fn commit(&mut self, len: usize) {
         // the len can be just right at the edge of buffer, so we need to wrap just in case

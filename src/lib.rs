@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 use std::num::NonZeroUsize;
 #[allow(unused_imports)]
 #[cfg(not(feature = "loom"))]
@@ -7,6 +9,8 @@ pub(crate) use std::{
     thread,
 };
 
+use crate::queue::QueuePtr;
+pub use crate::{receiver::Receiver, sender::Sender};
 #[allow(unused_imports)]
 #[cfg(feature = "loom")]
 pub(crate) use loom::{
@@ -15,13 +19,31 @@ pub(crate) use loom::{
     thread,
 };
 
-use crate::{queue::QueuePtr, receiver::Receiver, sender::Sender};
-
 mod padded;
 mod queue;
 mod receiver;
 mod sender;
 
+/// Creates a new single-producer single-consumer (SPSC) queue.
+///
+/// The queue has a fixed capacity and is lock-free. The capacity is rounded up to the next power of two.
+///
+/// # Arguments
+///
+/// * `capacity` - The minimum capacity of the queue. Will be rounded up to the next power of two.
+///
+/// # Returns
+///
+/// A tuple containing the [`Sender`] and [`Receiver`] handles.
+///
+/// # Examples
+///
+/// ```
+/// use std::num::NonZeroUsize;
+/// use gil::channel;
+///
+/// let (tx, rx) = channel(NonZeroUsize::new(1024).unwrap());
+/// ```
 pub fn channel(capacity: NonZeroUsize) -> (Sender, Receiver) {
     let (queue, mask) = QueuePtr::with_capacity(capacity);
     (Sender::new(queue.clone(), mask), Receiver::new(queue, mask))

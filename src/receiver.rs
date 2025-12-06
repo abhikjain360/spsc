@@ -4,6 +4,10 @@ use crate::{
     queue::QueuePtr,
 };
 
+/// The consumer end of the queue.
+///
+/// This struct is `Send` but not `Sync`. It can be moved to another thread, but cannot be shared
+/// across threads.
 pub struct Receiver {
     ptr: QueuePtr,
     local_tail: usize,
@@ -19,6 +23,12 @@ impl Receiver {
         }
     }
 
+    /// Attempts to receive a value from the queue without blocking.
+    ///
+    /// # Returns
+    ///
+    /// * `Some(value)` if a value is available.
+    /// * `None` if the queue is empty.
     pub fn try_recv(&mut self) -> Option<usize> {
         let current_head = self.load_head();
         let new_head = (current_head + 1) & self.mask;
@@ -38,6 +48,10 @@ impl Receiver {
         Some(ret)
     }
 
+    /// Receives a value from the queue, blocking if necessary.
+    ///
+    /// This method uses a spin loop to wait for available data in the queue.
+    /// For a non-blocking alternative, use [`Receiver::try_recv`].
     pub fn recv(&mut self) -> usize {
         let current_head = self.load_head();
         let new_head = (current_head + 1) & self.mask;
@@ -55,6 +69,9 @@ impl Receiver {
         ret
     }
 
+    /// Receives a value from the queue asynchronously.
+    ///
+    /// This method yields the current task if the queue is empty.
     #[cfg(feature = "async")]
     pub async fn recv_async(&mut self) -> usize {
         use std::task::Poll;
@@ -94,6 +111,17 @@ impl Receiver {
         .await
     }
 
+    /// Returns a slice to the available read buffer in the queue.
+    ///
+    /// This allows reading multiple items directly from the queue's memory (zero-copy),
+    /// bypassing the per-item overhead of `recv`.
+    ///
+    /// After reading from the buffer, you must call [`Receiver::advance`] to mark the items as consumed.
+    ///
+    /// # Returns
+    ///
+    /// A slice containing available items starting from the current head.
+    /// Note that this might not represent *all* available items if the buffer wraps around.
     pub fn read_buffer(&mut self) -> &[usize] {
         let start = self.load_head();
 
@@ -113,10 +141,16 @@ impl Receiver {
         }
     }
 
-    #[inline(always)]
+    /// Advances the consumer head by `len` items.
+    ///
+    /// This should be called after processing items obtained via [`Receiver::read_buffer`].
+    ///
     /// # Safety
-    /// - should be called only after getting a read slice from `read_buffer`
-    /// - `len` should be less than or equal to the length of slice given by `read_buffer`.
+    ///
+    /// * This function must only be called after reading data from the slice returned by [`Receiver::read_buffer`].
+    /// * `len` must be less than or equal to the length of the slice returned by the most recent call to [`Receiver::read_buffer`].
+    /// * Advancing past the available data in the buffer results in undefined behavior.
+    #[inline(always)]
     pub unsafe fn advance(&mut self, len: usize) {
         // the len can be just right at the edge of buffer, so we need to wrap just in case
         let new_head = (self.load_head() + len) & self.mask;

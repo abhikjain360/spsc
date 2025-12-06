@@ -14,7 +14,6 @@ Inspired by [Facebook's folly's ProducerConsumerQueue](https://github.com/facebo
 - **Blocking and non-blocking operations**: Both sync and async APIs
 - **Batch operations**: Send and receive multiple items efficiently
 - **Zero-copy operations**: Direct buffer access for maximum performance
-- **High performance** (probably): Competitive with Facebook's folly implementation
 
 ## Installation
 
@@ -22,7 +21,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-gil = "0.2"
+gil = "0.3"
 ```
 
 ## Usage
@@ -35,11 +34,12 @@ Consumer blocks until there is a value on the queue, or use `Receiver::try_recv`
 
 ```rust
 use std::thread;
+use std::num::NonZeroUsize;
 use gil::channel;
 
-const COUNT: u128 = 100_000;
+const COUNT: usize = 100_000;
 
-let (mut tx, mut rx) = channel(COUNT as usize);
+let (mut tx, mut rx) = channel(NonZeroUsize::new(COUNT).unwrap());
 
 let handle = thread::spawn(move || {
     for i in 0..COUNT {
@@ -59,11 +59,22 @@ handle.join().unwrap();
 
 ### Async Example
 
+To use async features, enable the `async` feature in your `Cargo.toml`.
+
+```toml
+[dependencies]
+gil = { version = "0.3", features = ["async"] }
+```
+
 ```rust
 use gil::channel;
-const COUNT: u128 = 100_000;
+use std::num::NonZeroUsize;
 
-let (mut tx, mut rx) = channel(COUNT as usize);
+# #[cfg(feature = "async")]
+# async fn example() {
+const COUNT: usize = 100_000;
+
+let (mut tx, mut rx) = channel(NonZeroUsize::new(COUNT).unwrap());
 
 let handle = tokio::spawn(async move {
     for i in 0..COUNT {
@@ -79,19 +90,21 @@ for i in 0..COUNT {
 }
 
 handle.await.unwrap();
+# }
 ```
 
 ### Non-blocking Operations
 
 ```rust
 use gil::channel;
+use std::num::NonZeroUsize;
 
-let (mut tx, mut rx) = channel(10);
+let (mut tx, mut rx) = channel(NonZeroUsize::new(10).unwrap());
 
 // Try to send without blocking
 match tx.try_send(42) {
-    Ok(()) => println!("Sent successfully"),
-    Err(val) => println!("Queue full, got value back: {}", val),
+    true => println!("Sent successfully"),
+    false => println!("Queue full"),
 }
 
 // Try to receive without blocking
@@ -101,50 +114,20 @@ match rx.try_recv() {
 }
 ```
 
-### Batch Operations
+### Batch Operations (Zero-copy)
 
-Batch operations are more efficient than individual sends/receives because they amortize the cost of atomic operations:
-
-```rust
-use std::thread;
-use std::collections::VecDeque;
-use gil::channel;
-
-let (mut tx, mut rx) = channel(256);
-
-thread::spawn(move || {
-    let values: Vec<u128> = (0..1000).collect();
-    // Send all values, blocking as necessary
-    tx.batch_send_all(values.into_iter());
-});
-
-let mut buffer = VecDeque::new();
-let mut received = 0;
-
-while received < 1000 {
-    // Receive up to 128 values at once
-    let count = rx.batch_recv(&mut buffer, 128);
-    received += count;
-    
-    for value in buffer.drain(..) {
-        println!("Received: {}", value);
-    }
-}
-```
-
-### Zero-Copy Operations
-
-For maximum performance, you can directly access the internal buffer:
+For maximum performance, you can directly access the internal buffer. This allows you to write or read multiple items at once, bypassing the per-item synchronization overhead.
 
 ```rust
 use gil::channel;
 use std::ptr;
+use std::num::NonZeroUsize;
 
-let (mut tx, mut rx) = channel(128);
+let (mut tx, mut rx) = channel(NonZeroUsize::new(128).unwrap());
 
 // Zero-copy write
-let data = [1u128, 2, 3, 4, 5];
-let slice = tx.get_write_slice();
+let data = [1usize, 2, 3, 4, 5];
+let slice = tx.write_buffer();
 let count = data.len().min(slice.len());
 
 unsafe {
@@ -153,18 +136,20 @@ unsafe {
         slice.as_mut_ptr(),
         count
     );
+    // Commit the written items to make them visible to the consumer
+    tx.commit(count);
 }
-tx.commit(count);
 
 // Zero-copy read
 let len = {
-    let slice = rx.get_read_slice();
+    let slice = rx.read_buffer();
     for &value in slice {
         println!("Value: {}", value);
     }
     slice.len()
 };
-rx.advance(len);
+// Advance the consumer head to mark items as processed
+unsafe { rx.advance(len); }
 ```
 
 ## Performance
@@ -176,33 +161,15 @@ The queue achieves high throughput through several optimizations:
 - **Batch operations**: Amortize atomic operation costs across multiple items
 - **Zero-copy API**: Direct buffer access eliminates memory copies
 
-On Apple M3, the queue can achieve ~50GB/s throughput and with batching and zero-copy operations. Latency is around 80ns, but depends on which cores the producer and consumer are running on.
-
 ## Type Constraints
 
-The queue works with:
-- `u128` on aarch64 (ARM64) architectures
-- `u64` on x86_64 architectures
-
-This allows the queue to store values that fit within these sizes directly. For larger types, consider using indices or pointers with an external storage mechanism.
+The current implementation is optimized for `usize`.
 
 ## Safety
 
 The code has been verified using:
 - [loom](https://github.com/tokio-rs/loom) - Concurrency testing
 - [miri](https://github.com/rust-lang/miri) - Undefined behavior detection
-
-## Future Improvements
-
-- [ ] More comprehensive benchmarks
-- [ ] Support for generic types (not just `u64`/`u128`) using custom arena allocators
-- [ ] Optimize for x86
-- [ ] Try benching with Intel x86's `cldemote` instruction
-- [ ] Run and benchmark on NVIDIA Grace (or any NVLink-C2C), just for fun and to see how fast this can really go. In theory NVIDIA Grace should go upto 900GB/s.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit issues or pull requests.
 
 ## License
 
