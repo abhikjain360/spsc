@@ -1,283 +1,212 @@
-//! Internal queue implementation for the SPSC channel.
-//!
-//! This module contains the low-level ring buffer implementation that powers
-//! both the synchronous and asynchronous channel operations.
-
-#[cfg(not(loomer))]
-use std::cell::{Cell, UnsafeCell};
+#[cfg(feature = "async")]
+use std::task::Waker;
 use std::{
-    alloc::{Layout, alloc, dealloc, handle_alloc_error},
-    mem::{MaybeUninit, size_of},
-    ptr,
+    mem::{align_of, offset_of, size_of},
+    num::NonZeroUsize,
+    ptr::NonNull,
 };
 
-#[cfg(loomer)]
-use loom::cell::{Cell, UnsafeCell};
+#[cfg(feature = "async")]
+use futures::task::AtomicWaker;
 
-use crate::{QueueValue, sync::*};
+#[cfg(feature = "async")]
+use crate::atomic::AtomicBool;
+use crate::{
+    alloc,
+    atomic::{AtomicUsize, Ordering},
+    padded::Padded,
+};
 
-/// Type alias for buffer cells, conditionally using loom's UnsafeCell for testing.
-#[cfg(not(loomer))]
-pub(crate) type BufferCell = UnsafeCell<MaybeUninit<QueueValue>>;
-
-/// Type alias for buffer cells when using loom for concurrency testing.
-#[cfg(loomer)]
-pub(crate) type BufferCell = loom::cell::UnsafeCell<MaybeUninit<QueueValue>>;
-
-/// Cache line size for x86_64 architectures (64 bytes).
-#[cfg(target_arch = "x86_64")]
-const CACHE_LINE_SIZE: usize = 64;
-
-/// Cache line size for aarch64 architectures (128 bytes).
-#[cfg(target_arch = "aarch64")]
-const CACHE_LINE_SIZE: usize = 128;
-
-/// The internal lock-free ring buffer used by `Sender` and `Receiver`.
-///
-/// This structure is carefully aligned to cache line boundaries to prevent false sharing
-/// between the producer and consumer. The head and tail indices are kept on separate
-/// cache lines to maximize performance.
-///
-/// # Layout
-///
-/// ```text
-/// ┌──────────────┐
-/// │ head         │  <- Consumer's read position (cache line aligned)
-/// ├──────────────┤
-/// │ padding      │
-/// ├──────────────┤
-/// │ tail         │  <- Producer's write position (cache line aligned)
-/// ├──────────────┤
-/// │ padding      │
-/// ├──────────────┤
-/// │ rc           │  <- Reference count
-/// │ capacity     │  <- Buffer capacity
-/// ├──────────────┤
-/// │ padding      │
-/// ├──────────────┤
-/// │ buffer[...]  │  <- Actual data storage
-/// └──────────────┘
-/// ```
-///
-/// # Invariants
-///
-/// - `head` points to the next valid value to read (unless `head == tail`)
-/// - `tail` points to the next position where a value should be written
-/// - When `head == tail`, the queue is empty
-/// - When `(tail + 1) % capacity == head`, the queue is full
-/// - The actual capacity is `capacity - 1` to distinguish empty from full
-#[cfg_attr(target_arch = "aarch64", repr(C, align(128)))]
-#[cfg_attr(target_arch = "x86_64", repr(C, align(64)))]
-pub(crate) struct Queue {
-    /// The read position (consumer side). Always on its own cache line to prevent false sharing.
-    pub(crate) head: AtomicUsize,
-    /// Consumer's cached tail value for reducing atomic loads.
-    pub(crate) local_tail: Cell<usize>,
-    /// Capacity mask (capacity - 1) for fast modulo via bitwise AND.
-    pub(crate) mask_consumer: usize,
-    /// Padding to ensure head is on its own cache line.
-    _pad1: [u8; CACHE_LINE_SIZE
-        - size_of::<AtomicUsize>()
-        - size_of::<Cell<usize>>()
-        - size_of::<usize>()],
-
-    /// The write position (producer side). Always on its own cache line to prevent false sharing.
-    pub(crate) tail: AtomicUsize,
-    /// Producer's cached head value for reducing atomic loads.
-    pub(crate) local_head: Cell<usize>,
-    /// Capacity mask (capacity - 1) for fast modulo via bitwise AND.
-    pub(crate) mask_producer: usize,
-    /// Padding to ensure tail is on its own cache line.
-    _pad2: [u8; CACHE_LINE_SIZE
-        - size_of::<AtomicUsize>()
-        - size_of::<Cell<usize>>()
-        - size_of::<usize>()],
-
-    /// Reference count for safe deallocation (2 when both sender and receiver exist).
-    pub(crate) rc: AtomicUsize,
-    /// The total capacity of the buffer (actual usable capacity is capacity - 1).
-    pub(crate) capacity: usize,
-    /// Padding to separate metadata from data.
-    _pad3: [u8; CACHE_LINE_SIZE - size_of::<AtomicUsize>() - size_of::<usize>()],
-
-    /// Zero-sized array that marks the start of the dynamically-sized buffer.
-    /// The actual buffer is allocated immediately after this structure.
-    pub(crate) buffer: [BufferCell; 0],
+struct CacheLine {
+    shared: AtomicUsize,
+    capacity: usize,
 }
 
-impl Queue {
-    /// Creates a new queue with the specified capacity.
-    ///
-    /// The queue is heap-allocated with a single allocation that includes both
-    /// the header (head, tail, rc, capacity) and the buffer array.
-    ///
-    /// # Arguments
-    ///
-    /// * `capacity` - The requested capacity. The actual capacity will be at least
-    ///   `capacity`, possibly more. Internally, the capacity is rounded up to the
-    ///   next power of 2 (after adding 1 to distinguish empty from full states)
-    ///   for efficient masking operations.
-    ///
-    /// # Returns
-    ///
-    /// A non-null pointer to the allocated queue structure.
-    ///
-    /// # Panics
-    ///
-    /// Panics if memory allocation fails.
-    #[inline]
-    pub(crate) fn with_capacity(capacity: usize) -> ptr::NonNull<Self> {
-        let internal_capacity = capacity + 1;
+/// # Invariants
+/// - tail should always point to the place where we can write next to.
+// avoid re-ordering fields
+#[repr(C)]
+struct Queue {
+    head: Padded<CacheLine>,
+    #[cfg(feature = "async")]
+    sender_sleeping: Padded<AtomicBool>,
+    #[cfg(feature = "async")]
+    receiver_waker: Padded<AtomicWaker>,
 
-        // Round up to next power of 2 for efficient masking
-        let capacity = internal_capacity.next_power_of_two();
+    tail: Padded<CacheLine>,
+    #[cfg(feature = "async")]
+    receiver_sleeping: Padded<AtomicBool>,
+    #[cfg(feature = "async")]
+    sender_waker: Padded<AtomicWaker>,
+
+    rc: AtomicUsize,
+
+    buffer: [usize; 0],
+}
+
+#[derive(Clone)]
+pub(crate) struct QueuePtr {
+    ptr: NonNull<Queue>,
+}
+
+macro_rules! _field {
+    ($ptr:expr, $($path:tt).+) => {
+        $ptr.byte_add(offset_of!(Queue, $($path).+))
+    };
+
+    ($ptr:expr, $($path:tt).+, $ty:ty) => {
+        $ptr.byte_add(offset_of!(Queue, $($path).+)).cast::<$ty>()
+    };
+}
+
+impl QueuePtr {
+    pub(crate) fn with_capacity(capacity: NonZeroUsize) -> (Self, usize) {
+        let capacity = capacity.saturating_add(1).get().next_power_of_two();
+
+        let (layout, _offset) = Self::layout(capacity);
+
+        // SAFETY: capacity > 0, so layout is non-zero too
+        let ptr = unsafe { alloc::alloc(layout) } as *mut Queue;
+        let Some(ptr) = NonNull::new(ptr) else {
+            std::alloc::handle_alloc_error(layout);
+        };
+
         let mask = capacity - 1;
-        let layout = Self::layout(capacity);
 
         unsafe {
-            let ptr = alloc(layout) as *mut Self;
-            if ptr.is_null() {
-                handle_alloc_error(layout);
-            }
+            ptr.write(Queue {
+                head: Padded::new(CacheLine {
+                    shared: AtomicUsize::new(0),
+                    capacity,
+                }),
+                tail: Padded::new(CacheLine {
+                    shared: AtomicUsize::new(0),
+                    capacity,
+                }),
 
-            ptr::addr_of_mut!((*ptr).head).write(AtomicUsize::new(0));
-            ptr::addr_of_mut!((*ptr).local_tail).write(Cell::new(0));
-            ptr::addr_of_mut!((*ptr).mask_consumer).write(mask);
-            ptr::addr_of_mut!((*ptr).tail).write(AtomicUsize::new(0));
-            ptr::addr_of_mut!((*ptr).local_head).write(Cell::new(0));
-            ptr::addr_of_mut!((*ptr).mask_producer).write(mask);
-            ptr::addr_of_mut!((*ptr).rc).write(AtomicUsize::new(0));
-            ptr::addr_of_mut!((*ptr).capacity).write(capacity);
+                #[cfg(feature = "async")]
+                sender_sleeping: Padded::new(AtomicBool::new(false)),
 
-            // Initialize buffer elements
-            let buffer_ptr = ptr::addr_of_mut!((*ptr).buffer) as *mut BufferCell;
-            for i in 0..capacity {
-                buffer_ptr
-                    .add(i)
-                    .write(UnsafeCell::new(MaybeUninit::uninit()));
-            }
+                #[cfg(feature = "async")]
+                receiver_sleeping: Padded::new(AtomicBool::new(false)),
 
-            ptr::NonNull::new_unchecked(ptr)
+                #[cfg(feature = "async")]
+                sender_waker: Padded::new(AtomicWaker::new()),
+
+                #[cfg(feature = "async")]
+                receiver_waker: Padded::new(AtomicWaker::new()),
+
+                rc: AtomicUsize::new(2),
+
+                buffer: [],
+            });
+        };
+
+        (Self { ptr }, mask)
+    }
+
+    fn layout(capacity: usize) -> (alloc::Layout, usize) {
+        let header_layout =
+            alloc::Layout::from_size_align(size_of::<Queue>(), align_of::<Queue>()).unwrap();
+        let buffer_layout = alloc::Layout::array::<usize>(capacity).unwrap();
+        header_layout.extend(buffer_layout).unwrap()
+    }
+
+    #[inline(always)]
+    pub(crate) fn head(&self) -> &AtomicUsize {
+        unsafe { _field!(self.ptr, head.value.shared, AtomicUsize).as_ref() }
+    }
+
+    #[inline(always)]
+    pub(crate) fn tail(&self) -> &AtomicUsize {
+        unsafe { _field!(self.ptr, tail.value.shared, AtomicUsize).as_ref() }
+    }
+
+    #[inline(always)]
+    pub(crate) unsafe fn at(&self, index: usize) -> NonNull<usize> {
+        unsafe { _field!(self.ptr, buffer, usize).add(index) }
+    }
+
+    #[inline(always)]
+    pub(crate) unsafe fn get(&self, index: usize) -> usize {
+        unsafe { self.at(index).read() }
+    }
+
+    #[inline(always)]
+    pub(crate) fn set(&self, index: usize, value: usize) {
+        unsafe { self.at(index).write(value) }
+    }
+
+    #[inline(always)]
+    pub(crate) fn head_capacity(&self) -> usize {
+        unsafe { _field!(self.ptr, head.value.capacity, usize).read() }
+    }
+
+    #[inline(always)]
+    pub(crate) fn tail_capacity(&self) -> usize {
+        unsafe { _field!(self.ptr, tail.value.capacity, usize).read() }
+    }
+}
+
+#[cfg(feature = "async")]
+impl QueuePtr {
+    #[inline(always)]
+    pub(crate) fn register_sender_waker(&self, waker: &Waker) {
+        unsafe {
+            _field!(self.ptr, sender_waker.value, AtomicWaker)
+                .as_ref()
+                .register(waker);
         }
     }
 
-    /// Calculates the memory layout for a queue with the given capacity.
-    ///
-    /// This includes both the queue header and the buffer array.
-    ///
-    /// # Arguments
-    ///
-    /// * `capacity` - The buffer capacity (not the usable capacity).
-    ///
-    /// # Returns
-    ///
-    /// The memory layout required for the queue allocation.
-    #[inline]
-    pub(crate) fn layout(capacity: usize) -> Layout {
-        let header = Layout::new::<Self>();
-        let array = Layout::array::<BufferCell>(capacity).unwrap();
-        header.extend(array).unwrap().0.pad_to_align()
-    }
-
-    /// Returns a pointer to the buffer element at the given index.
-    ///
-    /// # Safety
-    ///
-    /// - `ptr` must be a valid pointer to a Queue
-    /// - `idx` must be less than the queue's capacity
-    ///
-    /// # Arguments
-    ///
-    /// * `ptr` - Pointer to the queue
-    /// * `idx` - Index into the buffer
-    ///
-    /// # Returns
-    ///
-    /// A const pointer to the buffer cell at the given index.
-    #[inline]
-    pub(crate) unsafe fn elem(ptr: *mut Self, idx: usize) -> *const BufferCell {
+    #[inline(always)]
+    pub(crate) fn register_receiver_waker(&self, waker: &Waker) {
         unsafe {
-            let ptr = (ptr as *mut u8).add(std::mem::size_of::<Self>()) as *const BufferCell;
-            ptr.add(idx)
+            _field!(self.ptr, receiver_waker.value, AtomicWaker)
+                .as_ref()
+                .register(waker);
         }
     }
 
-    /// Returns a mutable pointer to the buffer element at the given index (loom only).
-    ///
-    /// This variant is only used when testing with loom for concurrency checking.
-    ///
-    /// # Safety
-    ///
-    /// - `ptr` must be a valid pointer to a Queue
-    /// - `idx` must be less than the queue's capacity
-    ///
-    /// # Arguments
-    ///
-    /// * `ptr` - Pointer to the queue
-    /// * `idx` - Index into the buffer
-    ///
-    /// # Returns
-    ///
-    /// A mutable pointer to the buffer cell at the given index.
-    #[cfg(loomer)]
-    #[inline]
-    pub(crate) unsafe fn elem_mut(ptr: *mut Self, idx: usize) -> *mut BufferCell {
+    #[inline(always)]
+    pub(crate) fn wake_sender(&self) {
         unsafe {
-            let ptr = (ptr as *mut u8).add(std::mem::size_of::<Self>()) as *mut BufferCell;
-            ptr.add(idx)
+            _field!(self.ptr, sender_waker.value, AtomicWaker)
+                .as_ref()
+                .wake();
         }
     }
 
-    /// Frees the queue and all remaining elements.
-    ///
-    /// This method drops all elements still in the queue and deallocates the memory.
-    ///
-    /// # Safety
-    ///
-    /// - Must only be called when the reference count has reached 0
-    /// - The caller must ensure exclusive access to the queue
-    /// - This is enforced by checking `rc` before calling `free`
-    ///
-    /// # Arguments
-    ///
-    /// * `ptr` - Non-null pointer to the queue to be freed
-    pub(crate) unsafe fn free(mut ptr: ptr::NonNull<Self>) {
-        let queue = unsafe { ptr.as_mut() };
-        let capacity = queue.capacity;
-        let mask = queue.mask_consumer;
-        let layout = Self::layout(capacity);
+    #[inline(always)]
+    pub(crate) fn wake_receiver(&self) {
+        unsafe {
+            _field!(self.ptr, receiver_waker.value, AtomicWaker)
+                .as_ref()
+                .wake();
+        }
+    }
 
-        let mut head = queue.head.load(Ordering::SeqCst);
-        let tail = queue.tail.load(Ordering::SeqCst);
+    #[inline(always)]
+    pub(crate) fn sender_sleeping(&self) -> &AtomicBool {
+        unsafe { _field!(self.ptr, sender_sleeping.value, AtomicBool).as_ref() }
+    }
 
-        while head != tail {
-            // SAFETY: we own all the existing values in the queue.
-            #[cfg(not(loomer))]
+    #[inline(always)]
+    pub(crate) fn receiver_sleeping(&self) -> &AtomicBool {
+        unsafe { _field!(self.ptr, receiver_sleeping.value, AtomicBool).as_ref() }
+    }
+}
+
+impl Drop for QueuePtr {
+    fn drop(&mut self) {
+        let rc = unsafe { _field!(self.ptr, rc, AtomicUsize).as_ref() };
+        if rc.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let capacity = self.head_capacity();
+            let (layout, _) = Self::layout(capacity);
             unsafe {
-                ptr::drop_in_place((*Self::elem(ptr.as_ptr(), head)).get().cast::<QueueValue>());
-            }
-            #[cfg(loomer)]
-            unsafe {
-                ptr::drop_in_place(
-                    (*Self::elem_mut(ptr.as_ptr(), head))
-                        .get_mut()
-                        .deref()
-                        .as_mut_ptr(),
-                );
-            }
-            head = (head + 1) & mask;
-        }
-
-        #[cfg(loomer)]
-        {
-            let buffer_ptr = queue.buffer.as_mut_ptr();
-            for i in 0..capacity {
-                unsafe {
-                    ptr::drop_in_place(buffer_ptr.add(i));
-                }
+                self.ptr.drop_in_place();
+                alloc::dealloc(self.ptr.cast().as_ptr(), layout);
             }
         }
-
-        unsafe { dealloc(ptr.as_ptr() as *mut u8, layout) };
     }
 }

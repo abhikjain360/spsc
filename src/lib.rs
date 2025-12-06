@@ -1,234 +1,133 @@
-#![doc = include_str!("../README.md")]
+use std::num::NonZeroUsize;
+#[allow(unused_imports)]
+#[cfg(not(feature = "loom"))]
+pub(crate) use std::{
+    alloc, cell, hint,
+    sync::{self, atomic},
+    thread,
+};
 
+#[allow(unused_imports)]
+#[cfg(feature = "loom")]
+pub(crate) use loom::{
+    alloc, cell, hint,
+    sync::{self, atomic},
+    thread,
+};
+
+use crate::{queue::QueuePtr, receiver::Receiver, sender::Sender};
+
+mod padded;
 mod queue;
 mod receiver;
 mod sender;
-mod sync;
 
-use queue::Queue;
-pub use receiver::Receiver;
-pub use sender::Sender;
-use sync::*;
-
-/// Wait For Event - puts the core into a low-power state until an event occurs.
-///
-/// On ARM64 architectures, this uses the `wfe` instruction for power-efficient waiting.
-/// On other architectures, or when testing with loom/miri, this is a no-op.
-///
-/// This is used internally by blocking operations when the queue is empty or full.
-#[inline(always)]
-pub(crate) fn wfe() {
-    #[cfg(all(target_arch = "aarch64", not(loomer), not(miri)))]
-    unsafe {
-        core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
-    }
+pub fn channel(capacity: NonZeroUsize) -> (Sender, Receiver) {
+    let (queue, mask) = QueuePtr::with_capacity(capacity);
+    (Sender::new(queue.clone(), mask), Receiver::new(queue, mask))
 }
 
-/// Send Event - wakes up cores waiting in WFE state.
-///
-/// On ARM64 architectures, this uses the `sev` instruction to wake waiting cores.
-/// On other architectures, or when testing with loom/miri, this is a no-op.
-///
-/// This is used internally after writing to the queue to potentially wake the other side.
-#[inline(always)]
-pub(crate) fn sev() {
-    #[cfg(all(target_arch = "aarch64", not(loomer), not(miri)))]
-    unsafe {
-        core::arch::asm!("sev", options(nomem, nostack, preserves_flags));
-    }
-}
-
-/// The value type stored in the queue on x86_64 architectures.
-#[cfg(target_arch = "x86_64")]
-pub type QueueValue = u64;
-
-/// The value type stored in the queue on aarch64 (ARM64) architectures.
-#[cfg(target_arch = "aarch64")]
-pub type QueueValue = u128;
-
-/// Creates a bounded single-producer single-consumer channel with the specified capacity.
-///
-/// Returns a tuple of `(Sender, Receiver)`. The sender can be used to push values
-/// into the queue, and the receiver can be used to pull values from the queue.
-///
-/// The queue works with `u128` on aarch64 and `u64` on x86_64.
-///
-/// # Arguments
-///
-/// * `capacity` - The maximum number of items that can be stored in the queue at once.
-///   This capacity is fixed and cannot be changed after creation.
-///   **Note:** The capacity must be one less than a power of 2 (e.g., 1, 3, 7, 15, 31, 63, 127, 255, 511, 1023, ...)
-///   to enable efficient masking operations. This is because internally the queue uses `capacity + 1` slots,
-///   which must be a power of 2.
-///
-/// # Examples
-///
-/// ```
-/// use gil::channel;
-///
-/// let (tx, rx) = channel(15); // 15 + 1 = 16, which is 2^4
-/// tx.send(42);
-/// assert_eq!(rx.recv(), 42);
-/// ```
-///
-/// # Panics
-///
-/// Panics if memory allocation fails or if `capacity + 1` is not a power of 2.
-#[inline]
-pub fn channel(capacity: usize) -> (Sender, Receiver) {
-    let queue_ptr = Queue::with_capacity(capacity);
-    unsafe {
-        queue_ptr.as_ref().rc.store(2, Ordering::SeqCst);
-    }
-
-    (Sender::new(queue_ptr), Receiver::new(queue_ptr))
-}
-
-#[cfg(test)]
+#[cfg(all(test, not(feature = "loom")))]
 mod test {
-    use std::collections::VecDeque;
-
     use super::*;
-
-    #[cfg(loomer)]
-    #[test]
-    fn basic_loomer() {
-        loom::model(|| {
-            let (tx, rx) = channel(4);
-
-            thread::spawn(move || {
-                for i in 0..4 {
-                    tx.send(i as QueueValue);
-                }
-            });
-
-            for i in 0..4 {
-                let r = rx.recv();
-                assert_eq!(r, i as QueueValue);
-            }
-        })
-    }
 
     #[test]
     fn test_valid_sends() {
-        const COUNTS: usize = 4096;
-        let (tx, rx) = channel(COUNTS);
+        const COUNTS: NonZeroUsize = NonZeroUsize::new(4096).unwrap();
+        let (mut tx, mut rx) = channel(COUNTS);
 
         thread::spawn(move || {
-            for i in 0..COUNTS << 3 {
-                tx.send(i as QueueValue);
+            for i in 0..COUNTS.get() << 3 {
+                tx.send(i as usize);
             }
         });
 
-        for i in 0..COUNTS << 3 {
+        for i in 0..COUNTS.get() << 3 {
             let r = rx.recv();
-            assert_eq!(r, i as QueueValue);
+            assert_eq!(r, i as usize);
         }
     }
 
+    #[cfg(feature = "async")]
     #[test]
     fn test_async_send() {
         futures::executor::block_on(async {
-            const COUNTS: usize = 4096;
+            const COUNTS: NonZeroUsize = NonZeroUsize::new(4096).unwrap();
 
             let (mut tx, mut rx) = channel(COUNTS);
 
             thread::spawn(move || {
-                for i in 0..COUNTS << 1 {
-                    futures::executor::block_on(tx.send_async(i as QueueValue));
+                for i in 0..COUNTS.get() << 1 {
+                    futures::executor::block_on(tx.send_async(i));
                 }
                 drop(tx);
             });
-            for i in 0..COUNTS << 1 {
-                assert_eq!(rx.recv_async().await, i as QueueValue);
+            for i in 0..COUNTS.get() << 1 {
+                assert_eq!(rx.recv_async().await, i);
             }
         });
     }
 
     #[test]
-    fn test_batch_send() {
-        const COUNTS: usize = 256;
-        let (tx, rx) = channel(COUNTS);
+    fn test_batched_send_recv() {
+        const CAPACITY: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
+        const TOTAL_ITEMS: usize = 1024 << 4;
+        let (mut tx, mut rx) = channel(CAPACITY);
 
         thread::spawn(move || {
-            let v: Vec<QueueValue> = (0..COUNTS).map(|i| i as QueueValue).collect();
-            for _ in 0..COUNTS << 1 {
-                tx.batch_send_all(v.iter().copied());
+            let mut sent = 0;
+            while sent < TOTAL_ITEMS {
+                let buffer = tx.write_buffer();
+                let batch_size = buffer.len().min(TOTAL_ITEMS - sent);
+                for i in 0..batch_size {
+                    buffer[i] = sent + i;
+                }
+                unsafe { tx.commit(batch_size) };
+                sent += batch_size;
             }
         });
 
-        for _ in 0..COUNTS << 1 {
-            for i in 0..COUNTS {
-                assert_eq!(rx.recv(), i as QueueValue);
+        let mut received = 0;
+        let mut expected = 0;
+
+        while received < TOTAL_ITEMS {
+            let buffer = rx.read_buffer();
+            if buffer.is_empty() {
+                continue;
             }
+            for &value in buffer.iter() {
+                assert_eq!(value, expected);
+                expected += 1;
+            }
+            let count = buffer.len();
+            unsafe { rx.advance(count) };
+            received += count;
         }
+
+        assert_eq!(received, TOTAL_ITEMS);
     }
+}
+
+#[cfg(all(test, feature = "loom"))]
+mod loom_test {
+    use super::*;
 
     #[test]
-    fn test_batch_recv() {
-        const COUNTS: usize = 256;
-
-        let (tx, rx) = channel(COUNTS);
-
-        thread::spawn(move || {
-            for i in 0..(COUNTS << 8) + (COUNTS >> 1) + 1 {
-                tx.send(i as QueueValue);
-            }
-        });
-
-        let mut buf = VecDeque::with_capacity(128);
-        let mut i = 0;
-        while i < (COUNTS << 8) + (COUNTS >> 1) + 1 {
-            rx.batch_recv(&mut buf, 128);
-            for val in buf.drain(..) {
-                assert_eq!(i as QueueValue, val);
-                i += 1;
-            }
-        }
-    }
-
-    #[test]
-    fn test_async_batch_send() {
-        futures::executor::block_on(async {
-            const COUNTS: usize = 256;
-            let (mut tx, rx) = channel(COUNTS);
+    fn basic_loom() {
+        loom::model(|| {
+            let (mut tx, mut rx) = channel(NonZeroUsize::new(4).unwrap());
+            let counts = 7;
 
             thread::spawn(move || {
-                let v: Vec<QueueValue> = (0..200).map(|i| i as QueueValue).collect();
-                for _ in 0..COUNTS << 1 {
-                    futures::executor::block_on(tx.batch_send_all_async(v.clone().into_iter()));
+                for i in 0..counts {
+                    tx.send(i);
                 }
             });
 
-            for _ in 0..COUNTS << 1 {
-                for i in 0..200 {
-                    assert_eq!(rx.recv(), i as QueueValue);
-                }
+            for i in 0..counts {
+                let r = rx.recv();
+                assert_eq!(r, i);
             }
-        });
-    }
-
-    #[test]
-    fn test_async_batch_recv() {
-        futures::executor::block_on(async {
-            const COUNTS: usize = 256;
-            let (tx, mut rx) = channel(COUNTS);
-
-            thread::spawn(move || {
-                for i in 0..(COUNTS << 8) + (COUNTS >> 1) + 1 {
-                    tx.send(i as QueueValue);
-                }
-            });
-
-            let mut buf = VecDeque::with_capacity(128);
-            let mut i = 0;
-            while i < (COUNTS << 8) + (COUNTS >> 1) + 1 {
-                rx.batch_recv_async(&mut buf, 128).await;
-                for val in buf.drain(..) {
-                    assert_eq!(i as QueueValue, val);
-                    i += 1;
-                }
-            }
-        });
+        })
     }
 }
